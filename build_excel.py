@@ -1,31 +1,22 @@
 """
-Build the V6E Excel calculator workbook.
+Build the V6E or V6F Excel calculator workbook.
 
-Four tabs:
-  1. README          - orientation
-  2. Coefficients    - 18 features + intercept + diagnostics
-  3. Loan_Snapshot   - per-loan formulas (raw -> contribution -> CPR -> attribution)
-  4. Deal_Aggregator - UPB-weighted rollup by deal_id
+Selects model via env var MODEL_VERSION (default v6e). Both produce the same
+4-tab layout (README / Coefficients / Loan_Snapshot / Deal_Aggregator); only
+the feature list, derivations, and per-loan input columns differ.
 
-All math is done with live Excel formulas, not values, so the workbook can be
-extended (paste in your own loans) and the user can audit any cell.
-
-Math form: centered native units.
+Math form (identical for both): centered native units.
     contribution_j = beta_native_j * (x_j - mean_j)
     total_logit_dev = SUM(contributions)
     logit_z = intercept_scaled + total_logit_dev
     SMM = 1 / (1 + EXP(-logit_z))
     pred_CPR = 1 - (1-SMM)^12
-    baseline_CPR = 1 - (1 - SIGMOID(intercept_scaled))^12   # CPR of a loan at feature means
+    baseline_CPR = 1 - (1 - SIGMOID(intercept_scaled))^12   # CPR at feature means
     attribution_j = (contribution_j / total_logit_dev) * (pred_CPR - baseline_CPR)
 
-Inputs (resolved relative to this script's directory):
-    model_data_v6e.json     - model coefficients (extracted from the JSX)
-    sample_loans.parquet    - 250-loan stratified sample (regenerated from
-                              panel parquet if the env var GNMA_PANEL_PARQUET
-                              points at the full panel)
-
-Output: V6E_Excel_Calculator.xlsx (next to this script)
+Usage:
+    MODEL_VERSION=v6e python3 build_excel.py        # default
+    MODEL_VERSION=v6f python3 build_excel.py
 """
 import json, math, os, sys
 from pathlib import Path
@@ -37,15 +28,25 @@ from openpyxl.utils import get_column_letter
 from openpyxl.workbook.defined_name import DefinedName
 
 HERE = Path(__file__).resolve().parent
-MODEL_JSON = HERE / "model_data_v6e.json"
+MODEL_VERSION = os.environ.get('MODEL_VERSION', 'v6e').lower()
+if MODEL_VERSION not in ('v6e', 'v6f'):
+    sys.exit(f"ERROR: unsupported MODEL_VERSION={MODEL_VERSION} (expected v6e or v6f)")
+
+MODEL_JSON = HERE / f"model_data_{MODEL_VERSION}.json"
 SAMPLE_PARQUET = HERE / "sample_loans.parquet"
-OUT_XLSX = HERE / "V6E_Excel_Calculator.xlsx"
+OUT_XLSX = HERE / f"{MODEL_VERSION.upper()}_Excel_Calculator.xlsx"
+
+if not MODEL_JSON.exists():
+    sys.exit(f"ERROR: {MODEL_JSON} not found - run train_{MODEL_VERSION}.py first")
 
 # ---------- Load model ----------
 md = json.load(open(MODEL_JSON))
 coefs = {c['feature']: c for c in md['coefficients']}
 intercept_scaled = md['metadata']['intercept_scaled']
-feature_list = md['metadata']['feature_list']  # 18 in canonical order
+feature_list = md['metadata']['feature_list']  # canonical order
+
+print(f"Building {OUT_XLSX.name} from {MODEL_JSON.name}")
+print(f"  Model: {MODEL_VERSION.upper()}  features={len(feature_list)}  test_AUC={md['metadata']['test_auc']:.4f}")
 
 
 def regenerate_sample(panel_path):
@@ -118,14 +119,14 @@ wb.remove(wb.active)
 # ============================================================
 ws = wb.create_sheet("README")
 readme_rows = [
-    ("V6E Voluntary Prepayment Calculator", BOLD),
+    (f"{MODEL_VERSION.upper()} Voluntary Prepayment Calculator", BOLD),
     ("", None),
-    (f"Model: V6E (18-feature logistic regression, test AUC {md['metadata']['test_auc']:.4f})", None),
+    (f"Model: {MODEL_VERSION.upper()} ({len(feature_list)}-feature logistic regression, test AUC {md['metadata']['test_auc']:.4f})", None),
     (f"Training period: {md['metadata']['period_range'][0]} to {md['metadata']['period_range'][1]}", None),
     (f"Training events: {md['metadata']['training_events']:,} voluntary prepays in {md['metadata']['training_pop_n']:,} eligible loan-months", None),
     ("", None),
     ("Tabs", BOLD),
-    ("  Coefficients     - 18 feature parameters + intercept + diagnostics. Edit at your own risk.", None),
+    (f"  Coefficients     - {len(feature_list)} feature parameters + intercept + diagnostics. Edit at your own risk.", None),
     ("  Loan_Snapshot    - one row per loan, current-period CPR + per-feature attribution.", None),
     ("                     Paste new loans into rows below the existing data; formulas autopopulate.", None),
     ("  Deal_Aggregator  - UPB-weighted deal-level rollup. Edit Deal_ID column in Loan_Snapshot to control grouping.", None),
@@ -166,7 +167,7 @@ ws.column_dimensions['A'].width = 110
 # Sheet 2: Coefficients
 # ============================================================
 ws = wb.create_sheet("Coefficients")
-ws.cell(1, 1, "V6E Voluntary Prepayment Model - Coefficients").font = Font(bold=True, size=14)
+ws.cell(1, 1, f"{MODEL_VERSION.upper()} Voluntary Prepayment Model - Coefficients").font = Font(bold=True, size=14)
 ws.cell(2, 1, "Edit at your own risk. Loan_Snapshot pulls mean/std/beta_native from this tab.").font = Font(italic=True, color="6B7280")
 
 headers = ["#", "feature", "group", "beta_scaled", "beta_native", "mean", "std", "label"]
@@ -247,10 +248,17 @@ ws = wb.create_sheet("Loan_Snapshot")
 
 # Layout columns:
 ID_COLS = ["loan_id", "deal_id", "pool_cusip", "issuer_name", "fha_category", "loan_purpose", "vintage_year", "period"]
-INPUT_COLS = ["upb", "loan_rate_pct", "plc_rate_bps", "prepay_penalty_points", "loan_age_months_in", "cum_itm_in", "in_prepay_penalty_in",
-              "is_hc_232_raw", "is_223a7_raw", "is_538_raw", "is_new_construction_raw"]
-# Feature columns (V6E in canonical order): each becomes a column. Some are formulas referencing inputs.
-# We'll keep this in canonical order so col mapping is clean.
+if MODEL_VERSION == 'v6e':
+    INPUT_COLS = ["upb", "loan_rate_pct", "plc_rate_bps", "prepay_penalty_points", "loan_age_months_in", "cum_itm_in", "in_prepay_penalty_in",
+                  "is_hc_232_raw", "is_223a7_raw", "is_538_raw", "is_new_construction_raw"]
+else:  # v6f
+    # V6F adds: loan_maturity_date_int (YYYYMM int form), lockout_end_date_int, issuer_number_str.
+    # Drops cum_itm_in and in_prepay_penalty_in (no longer used as features), but keeps cum_itm_in
+    # because burn_ratio still needs it as an input state variable.
+    INPUT_COLS = ["upb", "loan_rate_pct", "plc_rate_bps", "prepay_penalty_points", "loan_age_months_in",
+                  "cum_itm_in", "loan_maturity_yyyymm", "lockout_end_yyyymm", "issuer_number_str",
+                  "is_hc_232_raw", "is_223a7_raw", "is_538_raw", "is_new_construction_raw"]
+# Feature columns (canonical order): each becomes a column. Some are formulas referencing inputs.
 
 n_id = len(ID_COLS)
 n_input = len(INPUT_COLS)
@@ -319,25 +327,54 @@ IN_PLCBPS = COL_INPUT_START + 2
 IN_PPP = COL_INPUT_START + 3
 IN_AGE = COL_INPUT_START + 4
 IN_CUMITM = COL_INPUT_START + 5
-IN_INPEN = COL_INPUT_START + 6
-IN_HC232 = COL_INPUT_START + 7
-IN_223A7 = COL_INPUT_START + 8
-IN_538 = COL_INPUT_START + 9
-IN_NC = COL_INPUT_START + 10
+if MODEL_VERSION == 'v6e':
+    IN_INPEN = COL_INPUT_START + 6
+    IN_HC232 = COL_INPUT_START + 7
+    IN_223A7 = COL_INPUT_START + 8
+    IN_538   = COL_INPUT_START + 9
+    IN_NC    = COL_INPUT_START + 10
+else:  # v6f
+    IN_MTRDATE  = COL_INPUT_START + 6   # YYYYMM int (e.g. 204012 = Dec 2040)
+    IN_LOENDDATE = COL_INPUT_START + 7
+    IN_ISSNUM   = COL_INPUT_START + 8
+    IN_HC232    = COL_INPUT_START + 9
+    IN_223A7    = COL_INPUT_START + 10
+    IN_538      = COL_INPUT_START + 11
+    IN_NC       = COL_INPUT_START + 12
 
 DATA_START_ROW = 5
 N_LOANS = len(sample)
 
 # Issuer name patterns for dummy columns
-ISSUER_PATTERNS = {
-    'iss_capital_funding': 'CAPITAL FUNDING',
-    'iss_merchants':       'MERCHANTS',
-    'iss_wells_fargo':     'WELLS FARGO',
-    'iss_walker_dunlop':   'WALKER',
-    'iss_pnc':             'PNC',
-    'iss_berkadia':        'BERKADIA',
-    'iss_dwight':          'DWIGHT',
-}
+if MODEL_VERSION == 'v6e':
+    ISSUER_PATTERNS = {
+        'iss_capital_funding': 'CAPITAL FUNDING',
+        'iss_merchants':       'MERCHANTS',
+        'iss_wells_fargo':     'WELLS FARGO',
+        'iss_walker_dunlop':   'WALKER',
+        'iss_pnc':             'PNC',
+        'iss_berkadia':        'BERKADIA',
+        'iss_dwight':          'DWIGHT',
+    }
+else:  # v6f
+    ISSUER_PATTERNS = {
+        'iss_capital_funding': 'CAPITAL FUNDING',
+        'iss_wells_fargo':     'WELLS FARGO',
+        'iss_pnc':             'PNC',
+        'iss_dwight':          'DWIGHT',
+        'iss_greystone':       'GREYSTONE',
+        # iss_lument_combined uses issuer_number, handled below
+    }
+
+def parse_yyyymmdd_to_yyyymm(date_str):
+    """Convert YYYYMMDD string to YYYYMM int. Returns None if unparseable."""
+    if not date_str or pd.isna(date_str):
+        return None
+    s = str(date_str).strip()
+    if len(s) >= 6 and s[:4].isdigit() and s[4:6].isdigit():
+        return int(s[:6])
+    return None
+
 
 for i in range(N_LOANS):
     r = DATA_START_ROW + i
@@ -345,8 +382,6 @@ for i in range(N_LOANS):
     # Identifiers
     ws.cell(r, ID_LOAN, str(s['loan_id'])).font = MONO
     # Default Deal_ID groups by issuer + vintage era for a useful demo aggregation.
-    # GNMA MF pools are typically single-loan, so pool_cusip would yield 252 single-row deals.
-    # User overrides this column with their own deal mapping (e.g., CMBS deal name).
     issuer_short = str(s['issuer_name']).split()[0].replace(',', '').upper()[:12]
     era = "POST21" if (pd.notna(s['vintage_year']) and s['vintage_year'] >= 2021) else "PRE21"
     deal_default = f"{issuer_short}_{era}"
@@ -364,39 +399,126 @@ for i in range(N_LOANS):
     ws.cell(r, IN_PPP, float(s.get('prepay_penalty_points', 0)) if pd.notna(s.get('prepay_penalty_points', 0)) else 0).number_format = "0.0"
     ws.cell(r, IN_AGE, float(s['loan_age_months']))
     ws.cell(r, IN_CUMITM, int(s['cum_itm']))
-    ws.cell(r, IN_INPEN, int(s['in_prepay_penalty']))
     ws.cell(r, IN_HC232, int(s.get('is_hc_232', 0)))
     ws.cell(r, IN_223A7, int(s.get('is_223a7', 0)))
     ws.cell(r, IN_538, int(s.get('is_538', 0)))
     ws.cell(r, IN_NC, int(s.get('is_new_construction', 0)))
 
-    # Feature formulas (column COL_FEAT_START..)
-    # 1. refi_incentive_bps = loan_rate*100 - (plc_bps + (1+ppp)*12.5)
-    f_col = FEAT_COL['refi_incentive_bps']
-    ws.cell(r, f_col, f"={cl(IN_LOANRATE)}{r}*100-({cl(IN_PLCBPS)}{r}+(1+{cl(IN_PPP)}{r})*12.5)").number_format = "0.0"
-    # 2. in_prepay_penalty (passthrough from input)
-    ws.cell(r, FEAT_COL['in_prepay_penalty'], f"={cl(IN_INPEN)}{r}")
-    # 3. loan_age_months
-    ws.cell(r, FEAT_COL['loan_age_months'], f"={cl(IN_AGE)}{r}")
-    # 4. log_upb = LN(1 + upb)
-    ws.cell(r, FEAT_COL['log_upb'], f"=LN(1+{cl(IN_UPB)}{r})").number_format = "0.000"
-    # 5. is_post_covid = IF(vintage>=2021, 1, 0)
-    ws.cell(r, FEAT_COL['is_post_covid'], f"=IF({cl(ID_VY)}{r}>=2021,1,0)")
-    # 6. cum_itm
-    ws.cell(r, FEAT_COL['cum_itm'], f"={cl(IN_CUMITM)}{r}")
-    # 7. burn_ratio = cum_itm / MAX(loan_age, 1); guard against blank age
-    ws.cell(r, FEAT_COL['burn_ratio'],
-        f'=IF(ISNUMBER({cl(IN_AGE)}{r}),{cl(IN_CUMITM)}{r}/MAX({cl(IN_AGE)}{r},1),0)'
-    ).number_format = "0.000"
-    # 8-11. FHA/program flags
-    ws.cell(r, FEAT_COL['is_hc_232'], f"={cl(IN_HC232)}{r}")
-    ws.cell(r, FEAT_COL['is_223a7'], f"={cl(IN_223A7)}{r}")
-    ws.cell(r, FEAT_COL['is_538'], f"={cl(IN_538)}{r}")
-    ws.cell(r, FEAT_COL['lp_NC'], f"={cl(IN_NC)}{r}")
-    # 12-18. Issuer dummies via SEARCH on issuer_name
-    for fname, pat in ISSUER_PATTERNS.items():
-        col = FEAT_COL[fname]
-        ws.cell(r, col, f'=IF(ISNUMBER(SEARCH("{pat}",{cl(ID_ISSUER)}{r})),1,0)')
+    if MODEL_VERSION == 'v6e':
+        # V6E-only inputs
+        ws.cell(r, IN_INPEN, int(s['in_prepay_penalty']))
+        # V6E feature formulas
+        # 1. refi_incentive_bps = loan_rate*100 - (plc_bps + (1+ppp)*12.5)
+        ws.cell(r, FEAT_COL['refi_incentive_bps'],
+                f"={cl(IN_LOANRATE)}{r}*100-({cl(IN_PLCBPS)}{r}+(1+{cl(IN_PPP)}{r})*12.5)").number_format = "0.0"
+        # 2. in_prepay_penalty (passthrough)
+        ws.cell(r, FEAT_COL['in_prepay_penalty'], f"={cl(IN_INPEN)}{r}")
+        # 3. loan_age_months
+        ws.cell(r, FEAT_COL['loan_age_months'], f"={cl(IN_AGE)}{r}")
+        # 4. log_upb
+        ws.cell(r, FEAT_COL['log_upb'], f"=LN(1+{cl(IN_UPB)}{r})").number_format = "0.000"
+        # 5. is_post_covid
+        ws.cell(r, FEAT_COL['is_post_covid'], f"=IF({cl(ID_VY)}{r}>=2021,1,0)")
+        # 6. cum_itm
+        ws.cell(r, FEAT_COL['cum_itm'], f"={cl(IN_CUMITM)}{r}")
+        # 7. burn_ratio
+        ws.cell(r, FEAT_COL['burn_ratio'],
+            f'=IF(ISNUMBER({cl(IN_AGE)}{r}),{cl(IN_CUMITM)}{r}/MAX({cl(IN_AGE)}{r},1),0)'
+        ).number_format = "0.000"
+        # 8-11. FHA/program flags
+        ws.cell(r, FEAT_COL['is_hc_232'], f"={cl(IN_HC232)}{r}")
+        ws.cell(r, FEAT_COL['is_223a7'], f"={cl(IN_223A7)}{r}")
+        ws.cell(r, FEAT_COL['is_538'], f"={cl(IN_538)}{r}")
+        ws.cell(r, FEAT_COL['lp_NC'], f"={cl(IN_NC)}{r}")
+        # 12-18. Issuer dummies (V6E set)
+        for fname, pat in ISSUER_PATTERNS.items():
+            col = FEAT_COL[fname]
+            ws.cell(r, col, f'=IF(ISNUMBER(SEARCH("{pat}",{cl(ID_ISSUER)}{r})),1,0)')
+
+    else:  # v6f
+        # V6F-only inputs
+        mtr_yyyymm = parse_yyyymmdd_to_yyyymm(s.get('loan_maturity_date', ''))
+        lo_yyyymm  = parse_yyyymmdd_to_yyyymm(s.get('lockout_end_date', ''))
+        ws.cell(r, IN_MTRDATE, mtr_yyyymm if mtr_yyyymm is not None else '')
+        ws.cell(r, IN_LOENDDATE, lo_yyyymm if lo_yyyymm is not None else '')
+        ws.cell(r, IN_ISSNUM, str(s.get('issuer_number', '')))
+        # V6F feature formulas
+        # 1. gross_refi_incentive_bps = loan_rate*100 - plc_bps   (penalty-neutral)
+        ws.cell(r, FEAT_COL['gross_refi_incentive_bps'],
+                f"={cl(IN_LOANRATE)}{r}*100-{cl(IN_PLCBPS)}{r}").number_format = "0.0"
+        # 2. prepay_penalty_points (passthrough)
+        ws.cell(r, FEAT_COL['prepay_penalty_points'], f"={cl(IN_PPP)}{r}").number_format = "0.0"
+        # 3-5. Piecewise age
+        ws.cell(r, FEAT_COL['age_0_36'],
+                f"=MIN({cl(IN_AGE)}{r},36)").number_format = "0"
+        ws.cell(r, FEAT_COL['age_36_120'],
+                f"=MIN(MAX({cl(IN_AGE)}{r}-36,0),84)").number_format = "0"
+        ws.cell(r, FEAT_COL['age_120plus'],
+                f"=MAX({cl(IN_AGE)}{r}-120,0)").number_format = "0"
+        # 6. months_to_maturity = (maturity_yyyymm year)*12 + month - (period year)*12 - month, capped 0..480
+        # Period and maturity are YYYYMM integers like 202602 (year=2026, month=02)
+        # If maturity input is blank, default to 360 (long-tail).
+        mtm_formula = (
+            f'=IF(OR({cl(IN_MTRDATE)}{r}="",NOT(ISNUMBER({cl(IN_MTRDATE)}{r}))),360,'
+            f'MAX(0,MIN(480,'
+            f'(INT({cl(IN_MTRDATE)}{r}/100)-INT(VALUE({cl(ID_PERIOD)}{r})/100))*12'
+            f'+MOD({cl(IN_MTRDATE)}{r},100)-MOD(VALUE({cl(ID_PERIOD)}{r}),100))))'
+        )
+        ws.cell(r, FEAT_COL['months_to_maturity'], mtm_formula).number_format = "0"
+        # 7. pre_maturity_flag = IF(0 < mtm <= 24, 1, 0)
+        mtm_col = cl(FEAT_COL['months_to_maturity'])
+        ws.cell(r, FEAT_COL['pre_maturity_flag'],
+                f"=IF(AND({mtm_col}{r}>0,{mtm_col}{r}<=24),1,0)")
+        # 8. months_since_lockout_end = MAX(0, MIN(24, period - lockout_end)); 0 if no date
+        msle_formula = (
+            f'=IF(OR({cl(IN_LOENDDATE)}{r}="",NOT(ISNUMBER({cl(IN_LOENDDATE)}{r}))),0,'
+            f'MAX(0,MIN(24,'
+            f'(INT(VALUE({cl(ID_PERIOD)}{r})/100)-INT({cl(IN_LOENDDATE)}{r}/100))*12'
+            f'+MOD(VALUE({cl(ID_PERIOD)}{r}),100)-MOD({cl(IN_LOENDDATE)}{r},100))))'
+        )
+        ws.cell(r, FEAT_COL['months_since_lockout_end'], msle_formula).number_format = "0"
+        # 9. log_upb
+        ws.cell(r, FEAT_COL['log_upb'], f"=LN(1+{cl(IN_UPB)}{r})").number_format = "0.000"
+        # 10-11. Size flags
+        ws.cell(r, FEAT_COL['small_loan'], f"=IF({cl(IN_UPB)}{r}<2000000,1,0)")
+        ws.cell(r, FEAT_COL['large_loan'], f"=IF({cl(IN_UPB)}{r}>50000000,1,0)")
+        # 12. burn_ratio
+        ws.cell(r, FEAT_COL['burn_ratio'],
+            f'=IF(ISNUMBER({cl(IN_AGE)}{r}),{cl(IN_CUMITM)}{r}/MAX({cl(IN_AGE)}{r},1),0)'
+        ).number_format = "0.000"
+        # 13. is_post_covid
+        ws.cell(r, FEAT_COL['is_post_covid'], f"=IF({cl(ID_VY)}{r}>=2021,1,0)")
+        # 14-17. Program / purpose
+        ws.cell(r, FEAT_COL['is_223a7'], f"={cl(IN_223A7)}{r}")
+        ws.cell(r, FEAT_COL['is_538'], f"={cl(IN_538)}{r}")
+        ws.cell(r, FEAT_COL['is_hc_232'], f"={cl(IN_HC232)}{r}")
+        ws.cell(r, FEAT_COL['lp_NC'], f"={cl(IN_NC)}{r}")
+        # 18-22. Issuer dummies (V6F set, by name)
+        for fname, pat in ISSUER_PATTERNS.items():
+            col = FEAT_COL[fname]
+            ws.cell(r, col, f'=IF(ISNUMBER(SEARCH("{pat}",{cl(ID_ISSUER)}{r})),1,0)')
+        # 23. iss_lument_combined: by issuer_number IN ('3896','3557')
+        ws.cell(r, FEAT_COL['iss_lument_combined'],
+                f'=IF(OR({cl(IN_ISSNUM)}{r}="3896",{cl(IN_ISSNUM)}{r}="3557"),1,0)')
+        # 24+. Interactions (only emit those that are in feature_list)
+        if 'gross_refi__x__prepay_pen' in FEAT_COL:
+            ws.cell(r, FEAT_COL['gross_refi__x__prepay_pen'],
+                    f"={cl(FEAT_COL['gross_refi_incentive_bps'])}{r}*{cl(FEAT_COL['prepay_penalty_points'])}{r}").number_format = "0.0"
+        if 'age_0_36__x__lp_NC' in FEAT_COL:
+            ws.cell(r, FEAT_COL['age_0_36__x__lp_NC'],
+                    f"={cl(FEAT_COL['age_0_36'])}{r}*{cl(FEAT_COL['lp_NC'])}{r}").number_format = "0"
+        if 'age_0_36__x__is_hc_232' in FEAT_COL:
+            ws.cell(r, FEAT_COL['age_0_36__x__is_hc_232'],
+                    f"={cl(FEAT_COL['age_0_36'])}{r}*{cl(FEAT_COL['is_hc_232'])}{r}").number_format = "0"
+        if 'iss_lument__x__gross_refi' in FEAT_COL:
+            ws.cell(r, FEAT_COL['iss_lument__x__gross_refi'],
+                    f"={cl(FEAT_COL['iss_lument_combined'])}{r}*{cl(FEAT_COL['gross_refi_incentive_bps'])}{r}").number_format = "0.0"
+        if 'iss_dwight__x__gross_refi' in FEAT_COL:
+            ws.cell(r, FEAT_COL['iss_dwight__x__gross_refi'],
+                    f"={cl(FEAT_COL['iss_dwight'])}{r}*{cl(FEAT_COL['gross_refi_incentive_bps'])}{r}").number_format = "0.0"
+        if 'iss_greystone__x__gross_refi' in FEAT_COL:
+            ws.cell(r, FEAT_COL['iss_greystone__x__gross_refi'],
+                    f"={cl(FEAT_COL['iss_greystone'])}{r}*{cl(FEAT_COL['gross_refi_incentive_bps'])}{r}").number_format = "0.0"
 
     # Contribution columns: beta_native * (feature_value - mean)
     for k, f in enumerate(feature_list):
