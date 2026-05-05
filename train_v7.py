@@ -564,6 +564,82 @@ def build_attribution_loans(df_test: pd.DataFrame, params: dict, n: int = 8) -> 
     return out
 
 
+def build_sample_loans_table(df_test: pd.DataFrame, params: dict, n: int = 50) -> list:
+    """Stratified sample of test loans (5 per pred_CPR decile) with per-multiplier
+    log-attribution. Used by the dashboard's "Sample Loans" tab to show a population-
+    level view of where each multiplier is pulling each loan's CPR up vs down.
+
+    Attribution math (matches the Loan_Snapshot tab in V7_Excel_Calculator.xlsx):
+        log_mult_j = LN(M_factor_j)
+        attribution_j = log_mult_j / SUM(log_mults) × (pred_CPR − base_CPR)
+    Sum of attribution_j across multipliers ≈ pred_CPR − base_CPR (within rounding).
+    """
+    # Restrict to most recent test period to keep the sample interpretable
+    latest = sorted(df_test['period'].astype(str).unique())[-1]
+    pool = df_test[df_test['period'].astype(str) == latest].copy()
+    if len(pool) < n:
+        pool = df_test.copy()
+    if len(pool) == 0:
+        return []
+
+    # Score the pool, then stratified-sample by pred_CPR decile
+    feats_pool = features_dict(pool)
+    smm_pool = v7m.predict_smm(feats_pool, params)
+    cpr_pool = (1 - (1 - smm_pool) ** 12) * 100
+    pool = pool.assign(_cpr=cpr_pool).reset_index(drop=True)
+    pool['_dec'] = pd.qcut(pool['_cpr'].rank(method='first'), 10, labels=False, duplicates='drop')
+
+    per_dec = max(1, n // 10)
+    rng = np.random.default_rng(42)
+    chunks = []
+    for dec in sorted(pool['_dec'].dropna().unique()):
+        sub = pool[pool['_dec'] == dec]
+        take_idx = rng.choice(len(sub), size=min(per_dec, len(sub)), replace=False)
+        chunks.append(sub.iloc[take_idx])
+    sample = pd.concat(chunks).reset_index(drop=True).head(n)
+
+    # Compute multipliers + attribution per row
+    feats = features_dict(sample)
+    mults = v7m.compute_multipliers(feats, params)
+    smm = v7m.predict_smm(feats, params)
+    cpr = (1 - (1 - smm) ** 12) * 100
+    base_cpr = float(smm_to_cpr(params['base_smm']))
+
+    out = []
+    for i in range(len(sample)):
+        row = sample.iloc[i]
+        log_mults = {name: math.log(max(float(mults[name][i]), 1e-9))
+                     for name in v7m.MULTIPLIER_NAMES}
+        sum_log = sum(log_mults.values())
+        gap = float(cpr[i]) - base_cpr
+        # If sum_log ≈ 0 (rare: all multipliers ≈ 1), attribution is 0 by definition
+        attribution = {
+            name: round(log_mults[name] / sum_log * gap, 4) if abs(sum_log) > 1e-9 else 0.0
+            for name in v7m.MULTIPLIER_NAMES
+        }
+        out.append({
+            'loan_id':       str(row['loan_id'])[-12:],
+            'period':        str(row['period']),
+            'fha_category':  str(row.get('fha_category', '')),
+            'loan_purpose':  str(row.get('loan_purpose', '')),
+            'issuer':        str(row.get('issuer_name', ''))[:18],
+            'upb_M':         round(float(row['upb']) / 1e6, 1),
+            'age':           int(round(float(row['loan_age_months']))),
+            'mtm':           int(round(float(row['months_to_maturity']))),
+            'grf_bps':       round(float(row['gross_refi_incentive_bps']), 0),
+            'ppp':           round(float(row['prepay_penalty_points']), 1),
+            'net_refi_bps':  round(float(row['net_refi_incentive_bps']), 0),
+            'msle':          int(round(float(row['months_since_lockout_end']))),
+            'burn_ratio':    round(float(row['burn_ratio']), 3),
+            'pred_smm':      round(float(smm[i]), 6),
+            'pred_cpr':      round(float(cpr[i]), 2),
+            'actual_prepay': int(row['prepaid_voluntary']),
+            'multipliers':   {n: round(float(mults[n][i]), 4) for n in v7m.MULTIPLIER_NAMES},
+            'attribution':   attribution,
+        })
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Issuer residuals (separate artifact)
 # ---------------------------------------------------------------------------
@@ -789,6 +865,7 @@ def main():
 
     multiplier_curves = build_multiplier_curves(params_s2)
     attribution = build_attribution_loans(df_test, params_s2)
+    sample_loans = build_sample_loans_table(df_test, params_s2, n=50)
     issuer_residuals = build_issuer_residuals(df, params_s2)
     comparison = build_comparison(V6F_JSON, auc, ll, yearly, cal)
 
@@ -824,6 +901,7 @@ def main():
         'age_cuts': age_cuts, 'mtm_cuts': mtm_cuts, 'size_cuts': size_cuts,
         'post_lockout_cuts': post_lockout_cuts,
         'attribution_loans': attribution,
+        'sample_loans':      sample_loans,
         'sancap_benchmarks': grid,
         'comparison_to_v6f': comparison,
     }
