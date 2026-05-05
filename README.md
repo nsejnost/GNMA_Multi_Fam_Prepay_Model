@@ -7,7 +7,8 @@ Three model versions co-exist in this repo:
 |---|---|---|---|
 | V6E | Additive logit, 18 features | Production baseline | Existing reports |
 | V6F | Additive logit, 24 features | Frozen comparison | V7 vs V6F head-to-head |
-| **V7** | **Multiplicative, 9 bounded multipliers** | **Current** | **All new analysis** |
+| V7  | Multiplicative, 8 bounded multipliers | Current production | Parametric extrapolation, attribution |
+| **V8** | **Cohort-based S-curve (program × purpose × size)** | **Alternative methodology** | **Client-facing cohort views, direct SanCap mapping** |
 
 ## V7 highlights (current = V7.2)
 
@@ -62,12 +63,13 @@ BAM_gnpl_model_flipbook_202205_final.pdf
 ```bash
 # Train V7 + emit dashboard
 GNMA_PANEL_PARQUET=working/gnma_mf_panel.parquet python3 train_v7.py --emit-dashboard
-
-# Build the V7 Excel calculator
 MODEL_VERSION=v7 python3 build_excel.py
-
-# Run the 3-layer validation
 python3 validate_v7.py
+
+# Train V8 (cohort-based S-curve) + emit dashboard
+GNMA_PANEL_PARQUET=working/gnma_mf_panel.parquet python3 train_v8.py --emit-dashboard
+MODEL_VERSION=v8 python3 build_excel.py
+python3 validate_v8.py
 
 # Re-emit dashboard only (no retraining)
 python3 train_v7.py --only-emit-dashboard
