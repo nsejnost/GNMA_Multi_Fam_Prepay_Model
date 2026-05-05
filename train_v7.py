@@ -617,20 +617,58 @@ def build_sample_loans_table(df_test: pd.DataFrame, params: dict, n: int = 50) -
             name: round(log_mults[name] / sum_log * gap, 4) if abs(sum_log) > 1e-9 else 0.0
             for name in v7m.MULTIPLIER_NAMES
         }
+        # Helper: YYYYMMDD int/string → YYYY-MM display
+        def yyyymm(v):
+            try:
+                s = str(int(float(v))).strip()
+                if len(s) >= 6 and s[:4].isdigit() and s[4:6].isdigit():
+                    return f"{s[:4]}-{s[4:6]}"
+            except (TypeError, ValueError):
+                pass
+            return ''
+
+        # Penalty schedule: keep first 18 chars of prepay_desc (most common is
+        # "10,9,8,7,6,5,4,3,2,1,0" which fits)
+        prepay_desc = str(row.get('prepay_desc', '') or '').strip()
+        if len(prepay_desc) > 22:
+            prepay_desc = prepay_desc[:22] + '…'
+
         out.append({
             'loan_id':       str(row['loan_id'])[-12:],
+            'pool_cusip':    str(row.get('pool_cusip', ''))[:9],
             'period':        str(row['period']),
             'fha_category':  str(row.get('fha_category', '')),
             'loan_purpose':  str(row.get('loan_purpose', '')),
             'issuer':        str(row.get('issuer_name', ''))[:18],
-            'upb_M':         round(float(row['upb']) / 1e6, 1),
+            'state':         str(row.get('property_state', ''))[:2],
+            'num_units':     int(row['num_units']) if pd.notna(row.get('num_units')) else None,
+            # Loan terms (constant over a loan's life)
+            'coupon_pct':    round(float(row['loan_rate']), 3) if pd.notna(row.get('loan_rate')) else None,
+            'plc_pct':       round(float(row['plc_rate_bps']) / 100, 3) if pd.notna(row.get('plc_rate_bps')) else None,
+            'vintage':       int(row['vintage_year']) if pd.notna(row.get('vintage_year')) else None,
+            'origination':   yyyymm(row.get('origination_date')),
+            'maturity_date': yyyymm(row.get('loan_maturity_date')),
+            'orig_term_mo':  int(row['loan_term']) if pd.notna(row.get('loan_term')) else None,
+            'orig_upb_M':    round(float(row['upb_at_issuance']) / 1e6, 2)
+                              if pd.notna(row.get('upb_at_issuance')) else None,
+            'upb_M':         round(float(row['upb']) / 1e6, 2),
+            # Penalty / lockout (structural)
+            'lockout_yrs':   int(row['lockout_term_yrs']) if pd.notna(row.get('lockout_term_yrs')) else 0,
+            'prepay_yrs':    int(row['prepay_premium_period_yrs'])
+                              if pd.notna(row.get('prepay_premium_period_yrs')) else 0,
+            'lockout_end':   yyyymm(row.get('lockout_end_date')),
+            'prepay_end':    yyyymm(row.get('prepay_end_date')),
+            'prepay_desc':   prepay_desc,
+            # Time-varying
             'age':           int(round(float(row['loan_age_months']))),
             'mtm':           int(round(float(row['months_to_maturity']))),
+            'msle':          int(round(float(row['months_since_lockout_end']))),
+            'burn_ratio':    round(float(row['burn_ratio']), 3),
+            # Incentive
             'grf_bps':       round(float(row['gross_refi_incentive_bps']), 0),
             'ppp':           round(float(row['prepay_penalty_points']), 1),
             'net_refi_bps':  round(float(row['net_refi_incentive_bps']), 0),
-            'msle':          int(round(float(row['months_since_lockout_end']))),
-            'burn_ratio':    round(float(row['burn_ratio']), 3),
+            # Prediction
             'pred_smm':      round(float(smm[i]), 6),
             'pred_cpr':      round(float(cpr[i]), 2),
             'actual_prepay': int(row['prepaid_voluntary']),
