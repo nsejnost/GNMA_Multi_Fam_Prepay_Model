@@ -150,40 +150,49 @@ def build_readme(wb, md):
 # Sheet 2: Cohort_Sigmoids — every cohort_id with its sigmoid params
 # ---------------------------------------------------------------------------
 def build_cohort_sigmoids(wb, cohort_table, definitions):
-    """Cohort lookup table (one row per cohort, with cohort_id and 4 sigmoid params).
-    The Loan_Snapshot tab uses INDEX/MATCH against this table.
+    """Cohort lookup table (one row per cohort, sigmoid + age_ramp params).
+
+    V8.1: cohort_id is 4-part 'program|purpose|size|age_bucket'. Fallback ids
+    use '|ALL' for dropped axes. Each row also stores the 4 age_ramp knot
+    heights (knot_x positions are global constants in cohort_v8.py).
     """
     ws = wb.create_sheet("Cohort_Sigmoids")
-    ws.cell(1, 1, "V8 Per-Cohort Sigmoid Lookup Table").font = Font(bold=True, size=14)
-    ws.cell(2, 1, "Cohort_id format: 'program|purpose|size'. Fallback ids end in '|ALL' (level 1) or 'GLOBAL'.").font = Font(italic=True, color="6B7280")
+    ws.cell(1, 1, "V8.1 Per-Cohort Sigmoid + Age-Ramp Lookup Table").font = Font(bold=True, size=14)
+    ws.cell(2, 1, "Cohort_id format: 'program|purpose|size|age_bucket'. Fallback ids use '|ALL' for dropped axes; 'GLOBAL' is the universal fallback.").font = Font(italic=True, color="6B7280")
+    ws.cell(3, 1, "Sigmoid evaluates SMM at age=96m (anchor); age_ramp scales it for other ages. Knot positions: 0/24/96/240 months.").font = Font(italic=True, color="6B7280")
 
-    headers = ["cohort_id", "floor", "asymp", "mid", "slope", "n_loans", "n_events", "fit_quality"]
+    headers = ["cohort_id", "floor", "asymp", "mid", "slope",
+               "ramp_y0", "ramp_y1", "ramp_y2_anchor", "ramp_y3",
+               "n_loans", "n_events", "fit_quality"]
     for j, h in enumerate(headers, 1):
-        c = ws.cell(4, j, h); c.fill = HEADER_FILL; c.font = WHITE; c.alignment = CENTER
+        c = ws.cell(5, j, h); c.fill = HEADER_FILL; c.font = WHITE; c.alignment = CENTER
 
     diag_by_id = {d['cohort_id']: d for d in definitions}
     keys = sorted(cohort_table.keys(), key=lambda k: (k.count('ALL'), k == 'GLOBAL', k))
     for i, cid in enumerate(keys):
-        r = 5 + i
+        r = 6 + i
         p = cohort_table[cid]
         ws.cell(r, 1, cid).font = MONO
         ws.cell(r, 2, p['floor']).number_format = "0.0000000"
         ws.cell(r, 3, p['asymp']).number_format = "0.0000000"
         ws.cell(r, 4, p['mid']).number_format = "0.00"
         ws.cell(r, 5, p['slope']).number_format = "0.00"
+        knots_y = p.get('age_knots_y', [1.0, 1.0, 1.0, 1.0])
+        for k_i in range(4):
+            ws.cell(r, 6 + k_i, knots_y[k_i]).number_format = "0.0000"
         d = diag_by_id.get(cid, {})
-        ws.cell(r, 6, d.get('n', '')).number_format = "#,##0"
-        ws.cell(r, 7, d.get('n_events', ''))
-        ws.cell(r, 8, d.get('fit_quality', ''))
+        ws.cell(r, 10, d.get('n', '')).number_format = "#,##0"
+        ws.cell(r, 11, d.get('n_events', ''))
+        ws.cell(r, 12, d.get('fit_quality', ''))
 
-    # Define a single named range for the whole lookup table
-    end_row = 4 + len(keys)
-    table_ref = f"Cohort_Sigmoids!$A$5:$E${end_row}"
+    end_row = 5 + len(keys)
+    # Range covers all 9 lookup columns (cohort_id + 4 sigmoid + 4 age_knots)
+    table_ref = f"Cohort_Sigmoids!$A$6:$I${end_row}"
     wb.defined_names['V8_COHORT_TABLE'] = DefinedName('V8_COHORT_TABLE', attr_text=table_ref)
 
-    for col, w in zip([1, 2, 3, 4, 5, 6, 7, 8], [28, 12, 12, 10, 10, 12, 10, 14]):
+    for col, w in zip(range(1, 13), [34, 12, 12, 10, 10, 11, 11, 14, 11, 12, 10, 14]):
         ws.column_dimensions[cl(col)].width = w
-    ws.freeze_panes = "A5"
+    ws.freeze_panes = "A6"
 
 
 # ---------------------------------------------------------------------------
@@ -252,10 +261,12 @@ def build_loan_snapshot(wb, sample, cohort_table, v7_struct, smm_cap):
         ("Inputs", ["upb", "loan_rate_pct", "plc_rate_bps", "prepay_penalty_points",
                     "loan_age_months", "loan_maturity_yyyymm", "lockout_end_yyyymm",
                     "cum_itm", "burn_ratio_in"]),
-        ("Derived", ["program_key", "purpose_key", "size_bucket", "cohort_id",
-                     "gross_refi_bps", "net_refi_bps"]),
-        ("Cohort sigmoid", ["floor", "asymp", "mid", "slope", "cohort_smm", "cohort_cpr"]),
-        ("Structural mults", ["M_age", "M_maturity", "M_lockout", "M_burnout"]),
+        ("Derived (cohort id)", ["program_key", "purpose_key", "size_bucket",
+                                  "age_bucket", "cohort_id",
+                                  "gross_refi_bps", "net_refi_bps"]),
+        ("Cohort sigmoid", ["floor", "asymp", "mid", "slope", "cohort_smm_anchor"]),
+        ("Cohort age_ramp", ["ramp_y0", "ramp_y1", "ramp_y2", "ramp_y3", "age_ramp"]),
+        ("Structural mults", ["M_maturity", "M_lockout", "M_burnout"]),
         ("Output", ["pred_SMM", "pred_CPR"]),
     ]
     flat = [(grp, c) for grp, cols in headers for c in cols]
@@ -325,12 +336,18 @@ def build_loan_snapshot(wb, sample, cohort_table, v7_struct, smm_cap):
         ws.cell(r, col_idx['size_bucket'],
                 f'=IF({upb_col}{r}<5000000,"small",IF({upb_col}{r}<25000000,"medium","large"))')
 
-        # cohort_id = program | purpose | size
+        # age_bucket: young / seasoned / aged from loan_age_months
+        age_col = cl(col_idx['loan_age_months'])
+        ws.cell(r, col_idx['age_bucket'],
+                f'=IF({age_col}{r}<36,"young",IF({age_col}{r}<120,"seasoned","aged"))')
+
+        # cohort_id = program | purpose | size | age_bucket
         prog_col = cl(col_idx['program_key'])
         pur_col  = cl(col_idx['purpose_key'])
         sz_col   = cl(col_idx['size_bucket'])
+        ab_col   = cl(col_idx['age_bucket'])
         ws.cell(r, col_idx['cohort_id'],
-                f'={prog_col}{r}&"|"&{pur_col}{r}&"|"&{sz_col}{r}')
+                f'={prog_col}{r}&"|"&{pur_col}{r}&"|"&{sz_col}{r}&"|"&{ab_col}{r}')
 
         # gross / net refi bps
         ws.cell(r, col_idx['gross_refi_bps'],
@@ -340,51 +357,56 @@ def build_loan_snapshot(wb, sample, cohort_table, v7_struct, smm_cap):
                 f"={cl(col_idx['gross_refi_bps'])}{r}-12.5*({cl(col_idx['prepay_penalty_points'])}{r}+1)"
                 ).number_format = "0.0"
 
-        # Cohort sigmoid params via VLOOKUP into V8_COHORT_TABLE.
-        # Fallback chain: try primary, else level-1 (program|purpose|ALL), else level-2,
-        # else GLOBAL. Use IFERROR cascade.
+        # Cohort lookup via VLOOKUP cascade — 5 fallback levels:
+        # 0: program × purpose × size × age   (full cohort_id)
+        # 1: drop size → program × purpose × ALL × age
+        # 2: drop purpose → program × ALL × ALL × age
+        # 3: drop age → program × ALL × ALL × ALL
+        # 4: GLOBAL
         coh_col = cl(col_idx['cohort_id'])
-        # Build fallback ids inline via string concat
-        fb1 = f'{prog_col}{r}&"|"&{pur_col}{r}&"|ALL"'
-        fb2 = f'{prog_col}{r}&"|ALL|ALL"'
-        # VLOOKUP with cascade
-        for col_name, table_col in [('floor', 2), ('asymp', 3), ('mid', 4), ('slope', 5)]:
+        fb1 = f'{prog_col}{r}&"|"&{pur_col}{r}&"|ALL|"&{ab_col}{r}'
+        fb2 = f'{prog_col}{r}&"|ALL|ALL|"&{ab_col}{r}'
+        fb3 = f'{prog_col}{r}&"|ALL|ALL|ALL"'
+
+        # Lookup the 4 sigmoid params (cols 2-5) and 4 age_ramp knots (cols 6-9).
+        for col_name, table_col in [('floor', 2), ('asymp', 3), ('mid', 4), ('slope', 5),
+                                      ('ramp_y0', 6), ('ramp_y1', 7),
+                                      ('ramp_y2', 8), ('ramp_y3', 9)]:
             f_lookup = (
                 f'=IFERROR(VLOOKUP({coh_col}{r},V8_COHORT_TABLE,{table_col},FALSE),'
                 f'IFERROR(VLOOKUP({fb1},V8_COHORT_TABLE,{table_col},FALSE),'
                 f'IFERROR(VLOOKUP({fb2},V8_COHORT_TABLE,{table_col},FALSE),'
-                f'VLOOKUP("GLOBAL",V8_COHORT_TABLE,{table_col},FALSE))))'
+                f'IFERROR(VLOOKUP({fb3},V8_COHORT_TABLE,{table_col},FALSE),'
+                f'VLOOKUP("GLOBAL",V8_COHORT_TABLE,{table_col},FALSE)))))'
             )
             ws.cell(r, col_idx[col_name], f_lookup).number_format = "0.000000"
 
-        # cohort_smm = floor + asymp / (1 + EXP(-(net - mid)/slope))
+        # cohort_smm_anchor = sigmoid eval at anchor age (96m) — does NOT include ramp
         net_col = cl(col_idx['net_refi_bps'])
         floor_col = cl(col_idx['floor']);   asymp_col = cl(col_idx['asymp'])
         mid_col   = cl(col_idx['mid']);     slope_col = cl(col_idx['slope'])
-        ws.cell(r, col_idx['cohort_smm'],
+        ws.cell(r, col_idx['cohort_smm_anchor'],
                 f"={floor_col}{r}+{asymp_col}{r}/(1+EXP(-({net_col}{r}-{mid_col}{r})/{slope_col}{r}))"
                 ).number_format = "0.000000"
-        ws.cell(r, col_idx['cohort_cpr'],
-                f"=1-(1-{cl(col_idx['cohort_smm'])}{r})^12").number_format = "0.00%"
 
-        # M_age (piecewise linear), M_maturity, M_lockout, M_burnout via named cells
-        age_col = cl(col_idx['loan_age_months'])
-        f_age = (
-            f"=IF({age_col}{r}<=V8_AGE_KNOT_X_0,V8_AGE_KNOT_Y_0,"
-            f"IF({age_col}{r}>=V8_AGE_KNOT_X_5,V8_AGE_KNOT_Y_5,"
-            f"IF({age_col}{r}<=V8_AGE_KNOT_X_1,"
-                f"V8_AGE_KNOT_Y_0+({age_col}{r}-V8_AGE_KNOT_X_0)/(V8_AGE_KNOT_X_1-V8_AGE_KNOT_X_0)*(V8_AGE_KNOT_Y_1-V8_AGE_KNOT_Y_0),"
-            f"IF({age_col}{r}<=V8_AGE_KNOT_X_2,"
-                f"V8_AGE_KNOT_Y_1+({age_col}{r}-V8_AGE_KNOT_X_1)/(V8_AGE_KNOT_X_2-V8_AGE_KNOT_X_1)*(V8_AGE_KNOT_Y_2-V8_AGE_KNOT_Y_1),"
-            f"IF({age_col}{r}<=V8_AGE_KNOT_X_3,"
-                f"V8_AGE_KNOT_Y_2+({age_col}{r}-V8_AGE_KNOT_X_2)/(V8_AGE_KNOT_X_3-V8_AGE_KNOT_X_2)*(V8_AGE_KNOT_Y_3-V8_AGE_KNOT_Y_2),"
-            f"IF({age_col}{r}<=V8_AGE_KNOT_X_4,"
-                f"V8_AGE_KNOT_Y_3+({age_col}{r}-V8_AGE_KNOT_X_3)/(V8_AGE_KNOT_X_4-V8_AGE_KNOT_X_3)*(V8_AGE_KNOT_Y_4-V8_AGE_KNOT_Y_3),"
-                f"V8_AGE_KNOT_Y_4+({age_col}{r}-V8_AGE_KNOT_X_4)/(V8_AGE_KNOT_X_5-V8_AGE_KNOT_X_4)*(V8_AGE_KNOT_Y_5-V8_AGE_KNOT_Y_4)"
-            f"))))))"
+        # age_ramp = piecewise linear interp of (knot_x=[0,24,96,240], knot_y=lookup)
+        # at loan_age_months. 4 segments, with extrapolation flat outside [0, 240].
+        ry0 = cl(col_idx['ramp_y0']); ry1 = cl(col_idx['ramp_y1'])
+        ry2 = cl(col_idx['ramp_y2']); ry3 = cl(col_idx['ramp_y3'])
+        f_ramp = (
+            f"=IF({age_col}{r}<=0,{ry0}{r},"
+            f"IF({age_col}{r}>=240,{ry3}{r},"
+            f"IF({age_col}{r}<=24,"
+                f"{ry0}{r}+({age_col}{r}-0)/24*({ry1}{r}-{ry0}{r}),"
+            f"IF({age_col}{r}<=96,"
+                f"{ry1}{r}+({age_col}{r}-24)/72*({ry2}{r}-{ry1}{r}),"
+                f"{ry2}{r}+({age_col}{r}-96)/144*({ry3}{r}-{ry2}{r})"
+            f"))))"
         )
-        ws.cell(r, col_idx['M_age'], f_age).number_format = "0.0000"
+        ws.cell(r, col_idx['age_ramp'], f_ramp).number_format = "0.0000"
 
+        # Structural multipliers from V7 (M_maturity, M_lockout, M_burnout only;
+        # M_age is REPLACED by the per-cohort age_ramp above)
         period_col = cl(col_idx['period'])
         mat_col = cl(col_idx['loan_maturity_yyyymm'])
         mtm_expr = (f'IF(OR({mat_col}{r}="",NOT(ISNUMBER({mat_col}{r}))),360,'
@@ -410,10 +432,10 @@ def build_loan_snapshot(wb, sample, cohort_table, v7_struct, smm_cap):
                 f"=MAX(V8_BURN_FLOOR,1-V8_BURN_SLOPE*MIN(1,MAX(0,{br_col}{r})))"
                 ).number_format = "0.0000"
 
-        # Final pred_SMM = MIN(cohort_smm × structural multipliers, smm_cap)
+        # pred_SMM = MIN(cohort_sigmoid × age_ramp × structural mults, smm_cap)
         ws.cell(r, col_idx['pred_SMM'],
-                f"=MIN({cl(col_idx['cohort_smm'])}{r}"
-                f"*{cl(col_idx['M_age'])}{r}"
+                f"=MIN({cl(col_idx['cohort_smm_anchor'])}{r}"
+                f"*{cl(col_idx['age_ramp'])}{r}"
                 f"*{cl(col_idx['M_maturity'])}{r}"
                 f"*{cl(col_idx['M_lockout'])}{r}"
                 f"*{cl(col_idx['M_burnout'])}{r},{smm_cap})"
