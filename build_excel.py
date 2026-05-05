@@ -29,8 +29,16 @@ from openpyxl.workbook.defined_name import DefinedName
 
 HERE = Path(__file__).resolve().parent
 MODEL_VERSION = os.environ.get('MODEL_VERSION', 'v6e').lower()
-if MODEL_VERSION not in ('v6e', 'v6f'):
-    sys.exit(f"ERROR: unsupported MODEL_VERSION={MODEL_VERSION} (expected v6e or v6f)")
+if MODEL_VERSION not in ('v6e', 'v6f', 'v7'):
+    sys.exit(f"ERROR: unsupported MODEL_VERSION={MODEL_VERSION} (expected v6e, v6f, or v7)")
+
+# V7 uses a fundamentally different (multiplicative) architecture; dispatch to its
+# dedicated builder rather than threading conditionals throughout the additive-logit
+# code below.
+if MODEL_VERSION == 'v7':
+    import build_excel_v7
+    build_excel_v7.main()
+    sys.exit(0)
 
 MODEL_JSON = HERE / f"model_data_{MODEL_VERSION}.json"
 SAMPLE_PARQUET = HERE / "sample_loans.parquet"

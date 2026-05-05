@@ -1,0 +1,516 @@
+{
+ "description": "Per-issuer empirical residual ratio (actual_smm / pred_smm). Apply as optional overlay multiplier in dashboard / Excel. Default 1.0 keeps the core model issuer-neutral.",
+ "min_n": 1000,
+ "issuers": [
+  {
+   "issuer_number": "3896",
+   "issuer_name": "RED MORTGAGE CAPITAL, LLC.",
+   "n": 205895,
+   "actual_smm": 0.0078001,
+   "pred_smm": 0.0076246,
+   "residual_ratio": 1.023,
+   "actual_cpr": 8.9688,
+   "pred_cpr": 8.7754
+  },
+  {
+   "issuer_number": "4082",
+   "issuer_name": "BERKADIA COMMERCIAL MORTGAGE, LLC",
+   "n": 106649,
+   "actual_smm": 0.0086171,
+   "pred_smm": 0.0084128,
+   "residual_ratio": 1.0243,
+   "actual_cpr": 9.8642,
+   "pred_cpr": 9.6411
+  },
+  {
+   "issuer_number": "4080",
+   "issuer_name": "WALKER & DUNLOP, LLC",
+   "n": 87217,
+   "actual_smm": 0.0092528,
+   "pred_smm": 0.0093228,
+   "residual_ratio": 0.9925,
+   "actual_cpr": 10.5554,
+   "pred_cpr": 10.6311
+  },
+  {
+   "issuer_number": "4168",
+   "issuer_name": "GREYSTONE FUNDING COMPANY LLC",
+   "n": 59556,
+   "actual_smm": 0.0081436,
+   "pred_smm": 0.0062876,
+   "residual_ratio": 1.2952,
+   "actual_cpr": 9.3463,
+   "pred_cpr": 7.2896
+  },
+  {
+   "issuer_number": "3487",
+   "issuer_name": "MERCHANTS CAPITAL CORP.",
+   "n": 59501,
+   "actual_smm": 0.0068066,
+   "pred_smm": 0.0074168,
+   "residual_ratio": 0.9177,
+   "actual_cpr": 7.869,
+   "pred_cpr": 8.546
+  },
+  {
+   "issuer_number": "3998",
+   "issuer_name": "WELLS FARGO MULTIFAMILY CAPITAL",
+   "n": 53686,
+   "actual_smm": 0.0092203,
+   "pred_smm": 0.0106405,
+   "residual_ratio": 0.8665,
+   "actual_cpr": 10.5201,
+   "pred_cpr": 12.0472
+  },
+  {
+   "issuer_number": "3976",
+   "issuer_name": "PNC BANK, NA",
+   "n": 44978,
+   "actual_smm": 0.0068256,
+   "pred_smm": 0.0096245,
+   "residual_ratio": 0.7092,
+   "actual_cpr": 7.8901,
+   "pred_cpr": 10.9572
+  },
+  {
+   "issuer_number": "3866",
+   "issuer_name": "CAPITAL FUNDING,LLC.",
+   "n": 41909,
+   "actual_smm": 0.006013,
+   "pred_smm": 0.0087272,
+   "residual_ratio": 0.689,
+   "actual_cpr": 6.9817,
+   "pred_cpr": 9.9843
+  },
+  {
+   "issuer_number": "3153",
+   "issuer_name": "PRUDENTIAL HUNTOON PAIGE ASSOCIATES, LLC",
+   "n": 38806,
+   "actual_smm": 0.0081688,
+   "pred_smm": 0.0083198,
+   "residual_ratio": 0.9819,
+   "actual_cpr": 9.374,
+   "pred_cpr": 9.5393
+  },
+  {
+   "issuer_number": "4398",
+   "issuer_name": "DWIGHT CAPITAL LLC",
+   "n": 38790,
+   "actual_smm": 0.0076051,
+   "pred_smm": 0.0057271,
+   "residual_ratio": 1.3279,
+   "actual_cpr": 8.7539,
+   "pred_cpr": 6.6601
+  },
+  {
+   "issuer_number": "4012",
+   "issuer_name": "BONNEVILLE MORTGAGE COMPANY",
+   "n": 35248,
+   "actual_smm": 0.0044825,
+   "pred_smm": 0.0041047,
+   "residual_ratio": 1.092,
+   "actual_cpr": 5.2484,
+   "pred_cpr": 4.816
+  },
+  {
+   "issuer_number": "4271",
+   "issuer_name": "KEYBANK NATIONAL ASSOCIATION",
+   "n": 32397,
+   "actual_smm": 0.0090749,
+   "pred_smm": 0.0077994,
+   "residual_ratio": 1.1635,
+   "actual_cpr": 10.3625,
+   "pred_cpr": 8.968
+  },
+  {
+   "issuer_number": "4067",
+   "issuer_name": "BELLWETHER ENTERPRISE REAL ESTATE CAPITA",
+   "n": 27200,
+   "actual_smm": 0.0038603,
+   "pred_smm": 0.0068925,
+   "residual_ratio": 0.5601,
+   "actual_cpr": 4.5353,
+   "pred_cpr": 7.9646
+  },
+  {
+   "issuer_number": "3995",
+   "issuer_name": "DOUGHERTY MORTGAGE, LLC",
+   "n": 25918,
+   "actual_smm": 0.0085269,
+   "pred_smm": 0.0094572,
+   "residual_ratio": 0.9016,
+   "actual_cpr": 9.7658,
+   "pred_cpr": 10.7765
+  },
+  {
+   "issuer_number": "2045",
+   "issuer_name": "GERSHMAN INVESTMENT CORP.",
+   "n": 24926,
+   "actual_smm": 0.0121159,
+   "pred_smm": 0.0066008,
+   "residual_ratio": 1.8355,
+   "actual_cpr": 13.6083,
+   "pred_cpr": 7.6397
+  },
+  {
+   "issuer_number": "4065",
+   "issuer_name": "JONES LANG LASALLE MULTIFAMILY LLC",
+   "n": 24725,
+   "actual_smm": 0.0082912,
+   "pred_smm": 0.0071801,
+   "residual_ratio": 1.1548,
+   "actual_cpr": 9.508,
+   "pred_cpr": 8.2839
+  },
+  {
+   "issuer_number": "4300",
+   "issuer_name": "MIDLAND STATES BANK",
+   "n": 23852,
+   "actual_smm": 0.0081754,
+   "pred_smm": 0.0059871,
+   "residual_ratio": 1.3655,
+   "actual_cpr": 9.3812,
+   "pred_cpr": 6.9526
+  },
+  {
+   "issuer_number": "4016",
+   "issuer_name": "GRANDBRIDGE REAL ESTATE CAPITAL, LLC",
+   "n": 22330,
+   "actual_smm": 0.0098074,
+   "pred_smm": 0.008972,
+   "residual_ratio": 1.0931,
+   "actual_cpr": 11.1544,
+   "pred_cpr": 10.2507
+  },
+  {
+   "issuer_number": "3044",
+   "issuer_name": "CENTENNIAL MORTGAGE, INC",
+   "n": 19380,
+   "actual_smm": 0.005418,
+   "pred_smm": 0.0071509,
+   "residual_ratio": 0.7577,
+   "actual_cpr": 6.3113,
+   "pred_cpr": 8.2515
+  },
+  {
+   "issuer_number": "4223",
+   "issuer_name": "NEWPOINT REAL ESTATE CAPITAL LLC",
+   "n": 19271,
+   "actual_smm": 0.00576,
+   "pred_smm": 0.0048104,
+   "residual_ratio": 1.1974,
+   "actual_cpr": 6.6971,
+   "pred_cpr": 5.6222
+  },
+  {
+   "issuer_number": "3201",
+   "issuer_name": "LOVE FUNDING CORPORATION",
+   "n": 17192,
+   "actual_smm": 0.0108772,
+   "pred_smm": 0.0133167,
+   "residual_ratio": 0.8168,
+   "actual_cpr": 12.2994,
+   "pred_cpr": 14.86
+  },
+  {
+   "issuer_number": "4347",
+   "issuer_name": "CHURCHILL MORTGAGE INVESTMENT LLC",
+   "n": 16345,
+   "actual_smm": 0.0041603,
+   "pred_smm": 0.0031121,
+   "residual_ratio": 1.3368,
+   "actual_cpr": 4.8797,
+   "pred_cpr": 3.6712
+  },
+  {
+   "issuer_number": "3733",
+   "issuer_name": "CAMBRIDGE REALTY CAPITAL LTD OF ILLINOIS",
+   "n": 15547,
+   "actual_smm": 0.0091336,
+   "pred_smm": 0.0070988,
+   "residual_ratio": 1.2866,
+   "actual_cpr": 10.4261,
+   "pred_cpr": 8.1937
+  },
+  {
+   "issuer_number": "3500",
+   "issuer_name": "GREYSTONE SERVICING CORPORATION, INC.",
+   "n": 14935,
+   "actual_smm": 0.0067626,
+   "pred_smm": 0.0077619,
+   "residual_ratio": 0.8713,
+   "actual_cpr": 7.82,
+   "pred_cpr": 8.9268
+  },
+  {
+   "issuer_number": "3640",
+   "issuer_name": "M&T REALTY CAPITAL CORPORATION",
+   "n": 12704,
+   "actual_smm": 0.0089736,
+   "pred_smm": 0.0082897,
+   "residual_ratio": 1.0825,
+   "actual_cpr": 10.2524,
+   "pred_cpr": 9.5064
+  },
+  {
+   "issuer_number": "4265",
+   "issuer_name": "MERCHANTS CAPITAL SERVICING LLC",
+   "n": 12124,
+   "actual_smm": 0.0031343,
+   "pred_smm": 0.0053795,
+   "residual_ratio": 0.5826,
+   "actual_cpr": 3.697,
+   "pred_cpr": 6.2678
+  },
+  {
+   "issuer_number": "4051",
+   "issuer_name": "CBRE HMF, INC.",
+   "n": 11087,
+   "actual_smm": 0.0086588,
+   "pred_smm": 0.0089197,
+   "residual_ratio": 0.9707,
+   "actual_cpr": 9.9097,
+   "pred_cpr": 10.1938
+  },
+  {
+   "issuer_number": "4147",
+   "issuer_name": "CAPITAL ONE MULTIFAMILY FINANCE LLC",
+   "n": 10628,
+   "actual_smm": 0.0111968,
+   "pred_smm": 0.0079742,
+   "residual_ratio": 1.4041,
+   "actual_cpr": 12.6389,
+   "pred_cpr": 9.1603
+  },
+  {
+   "issuer_number": "3991",
+   "issuer_name": "HOUSING & HEALTHCARE FINANCE, LLC",
+   "n": 10481,
+   "actual_smm": 0.0169831,
+   "pred_smm": 0.0134878,
+   "residual_ratio": 1.2591,
+   "actual_cpr": 18.5799,
+   "pred_cpr": 15.037
+  },
+  {
+   "issuer_number": "2973",
+   "issuer_name": "DAVIS-PENN MORTGAGE CO.",
+   "n": 9340,
+   "actual_smm": 0.0089936,
+   "pred_smm": 0.0079813,
+   "residual_ratio": 1.1268,
+   "actual_cpr": 10.2741,
+   "pred_cpr": 9.1681
+  },
+  {
+   "issuer_number": "4170",
+   "issuer_name": "BERKELEY POINT CAPITAL DBA NEWMARK KNIGH",
+   "n": 8951,
+   "actual_smm": 0.0088258,
+   "pred_smm": 0.0114646,
+   "residual_ratio": 0.7698,
+   "actual_cpr": 10.0917,
+   "pred_cpr": 12.9224
+  },
+  {
+   "issuer_number": "3785",
+   "issuer_name": "LANCASTER POLLARD MORTGAGE COMPANY, LLC",
+   "n": 8683,
+   "actual_smm": 0.0040309,
+   "pred_smm": 0.0060979,
+   "residual_ratio": 0.661,
+   "actual_cpr": 4.7312,
+   "pred_cpr": 7.077
+  },
+  {
+   "issuer_number": "4013",
+   "issuer_name": "NORTHMARQ FINANCE, LLC",
+   "n": 7885,
+   "actual_smm": 0.0069753,
+   "pred_smm": 0.0079017,
+   "residual_ratio": 0.8828,
+   "actual_cpr": 8.0566,
+   "pred_cpr": 9.0806
+  },
+  {
+   "issuer_number": "4188",
+   "issuer_name": "HIGHLAND COMMERCIAL MORTGAGE, LLC.",
+   "n": 7547,
+   "actual_smm": 0.0106002,
+   "pred_smm": 0.0078172,
+   "residual_ratio": 1.356,
+   "actual_cpr": 12.0043,
+   "pred_cpr": 8.9877
+  },
+  {
+   "issuer_number": "3758",
+   "issuer_name": "ARBOR AGENCY LENDING, LLC",
+   "n": 7391,
+   "actual_smm": 0.0073062,
+   "pred_smm": 0.0064351,
+   "residual_ratio": 1.1354,
+   "actual_cpr": 8.4236,
+   "pred_cpr": 7.4546
+  },
+  {
+   "issuer_number": "4404",
+   "issuer_name": "AGM FINANCIAL SERVICES, INC.",
+   "n": 7000,
+   "actual_smm": 0.0031429,
+   "pred_smm": 0.0041316,
+   "residual_ratio": 0.7607,
+   "actual_cpr": 3.7069,
+   "pred_cpr": 4.8468
+  },
+  {
+   "issuer_number": "3799",
+   "issuer_name": "CENTURY HEALTH CAPITAL, INC",
+   "n": 6356,
+   "actual_smm": 0.0086532,
+   "pred_smm": 0.0069337,
+   "residual_ratio": 1.248,
+   "actual_cpr": 9.9037,
+   "pred_cpr": 8.0103
+  },
+  {
+   "issuer_number": "4281",
+   "issuer_name": "MASSACHUSETTS HOUSING FINANCE AGENCY",
+   "n": 5725,
+   "actual_smm": 0.0033188,
+   "pred_smm": 0.0068969,
+   "residual_ratio": 0.4812,
+   "actual_cpr": 3.9106,
+   "pred_cpr": 7.9694
+  },
+  {
+   "issuer_number": "3455",
+   "issuer_name": "ARMSTRONG MORTGAGE COMPANY",
+   "n": 5122,
+   "actual_smm": 0.007419,
+   "pred_smm": 0.0077663,
+   "residual_ratio": 0.9553,
+   "actual_cpr": 8.5483,
+   "pred_cpr": 8.9317
+  },
+  {
+   "issuer_number": "1535",
+   "issuer_name": "ROSE COMMUNITY CAPITAL, LLC",
+   "n": 5116,
+   "actual_smm": 0.0066458,
+   "pred_smm": 0.0074822,
+   "residual_ratio": 0.8882,
+   "actual_cpr": 7.6898,
+   "pred_cpr": 8.6183
+  },
+  {
+   "issuer_number": "3854",
+   "issuer_name": "X-CALIBER CAPITAL CORP.",
+   "n": 4928,
+   "actual_smm": 0.0048701,
+   "pred_smm": 0.0062778,
+   "residual_ratio": 0.7758,
+   "actual_cpr": 5.6901,
+   "pred_cpr": 7.2786
+  },
+  {
+   "issuer_number": "3752",
+   "issuer_name": "FIRST HOUSING DEVELOPMENT CORPORATION OF",
+   "n": 4540,
+   "actual_smm": 0.011674,
+   "pred_smm": 0.0104566,
+   "residual_ratio": 1.1164,
+   "actual_cpr": 13.1434,
+   "pred_cpr": 11.8509
+  },
+  {
+   "issuer_number": "3969",
+   "issuer_name": "FIRST AMERICAN CAPITAL GROUP CORPORATION",
+   "n": 4387,
+   "actual_smm": 0.0072943,
+   "pred_smm": 0.0065563,
+   "residual_ratio": 1.1126,
+   "actual_cpr": 8.4104,
+   "pred_cpr": 7.59
+  },
+  {
+   "issuer_number": "4380",
+   "issuer_name": "SUNTRUST BANK",
+   "n": 4222,
+   "actual_smm": 0.0040265,
+   "pred_smm": 0.0108962,
+   "residual_ratio": 0.3695,
+   "actual_cpr": 4.7263,
+   "pred_cpr": 12.3196
+  },
+  {
+   "issuer_number": "3965",
+   "issuer_name": "COLUMBIANATIONAL REAL ESTATE FINANCE, LL",
+   "n": 3266,
+   "actual_smm": 0.0094917,
+   "pred_smm": 0.0114062,
+   "residual_ratio": 0.8322,
+   "actual_cpr": 10.8139,
+   "pred_cpr": 12.8606
+  },
+  {
+   "issuer_number": "3912",
+   "issuer_name": "ZIEGLER FINANCING CORPORATION",
+   "n": 2981,
+   "actual_smm": 0.0110701,
+   "pred_smm": 0.0086016,
+   "residual_ratio": 1.287,
+   "actual_cpr": 12.5044,
+   "pred_cpr": 9.8473
+  },
+  {
+   "issuer_number": "4411",
+   "issuer_name": "REGIONS BANK",
+   "n": 2228,
+   "actual_smm": 0.0004488,
+   "pred_smm": 0.0036727,
+   "residual_ratio": 0.1222,
+   "actual_cpr": 0.5373,
+   "pred_cpr": 4.3193
+  },
+  {
+   "issuer_number": "4451",
+   "issuer_name": "HARPER CAPITAL PARTNERS, LLC",
+   "n": 1805,
+   "actual_smm": 0.0,
+   "pred_smm": 0.0033426,
+   "residual_ratio": 0.0,
+   "actual_cpr": 0.0,
+   "pred_cpr": 3.9382
+  },
+  {
+   "issuer_number": "4084",
+   "issuer_name": "NORTHPOINT CAPITAL, LLC",
+   "n": 1598,
+   "actual_smm": 0.005632,
+   "pred_smm": 0.008256,
+   "residual_ratio": 0.6822,
+   "actual_cpr": 6.553,
+   "pred_cpr": 9.4695
+  },
+  {
+   "issuer_number": "3557",
+   "issuer_name": "HUNT MORTGAGE CAPITAL, LLC",
+   "n": 1494,
+   "actual_smm": 0.0040161,
+   "pred_smm": 0.0102946,
+   "residual_ratio": 0.3901,
+   "actual_cpr": 4.7142,
+   "pred_cpr": 11.6775
+  },
+  {
+   "issuer_number": "3958",
+   "issuer_name": "MIDCAP FINANCIAL HOUSING CAPITAL, INC.",
+   "n": 1292,
+   "actual_smm": 0.0154799,
+   "pred_smm": 0.0057989,
+   "residual_ratio": 2.6695,
+   "actual_cpr": 17.0731,
+   "pred_cpr": 6.741
+  }
+ ]
+}
