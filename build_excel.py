@@ -29,11 +29,10 @@ from openpyxl.workbook.defined_name import DefinedName
 
 HERE = Path(__file__).resolve().parent
 MODEL_VERSION = os.environ.get('MODEL_VERSION', 'v6e').lower()
-if MODEL_VERSION not in ('v6e', 'v6f', 'v7', 'v8'):
-    sys.exit(f"ERROR: unsupported MODEL_VERSION={MODEL_VERSION} (expected v6e, v6f, v7, or v8)")
+if MODEL_VERSION not in ('v6e', 'v6f', 'v7', 'v8', 'v9'):
+    sys.exit(f"ERROR: unsupported MODEL_VERSION={MODEL_VERSION} (expected v6e, v6f, v7, v8, or v9)")
 
-# V7 and V8 use fundamentally different architectures (multiplicative vs cohort
-# S-curve); each has its own dedicated builder.
+# V7, V8, V9 each have dedicated builders (multiplicative / cohort / Richards-cohort)
 if MODEL_VERSION == 'v7':
     import build_excel_v7
     build_excel_v7.main()
@@ -41,6 +40,10 @@ if MODEL_VERSION == 'v7':
 if MODEL_VERSION == 'v8':
     import build_excel_v8
     build_excel_v8.main()
+    sys.exit(0)
+if MODEL_VERSION == 'v9':
+    import build_excel_v9
+    build_excel_v9.main()
     sys.exit(0)
 
 MODEL_JSON = HERE / f"model_data_{MODEL_VERSION}.json"
