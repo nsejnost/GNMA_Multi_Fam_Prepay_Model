@@ -2,7 +2,8 @@
 V7 validation — three layers:
 
   Layer 1: Excel-vs-Python parity on 30 sample loans (max abs diff < 1e-6).
-  Layer 2: Tail-blowup detector — score the FULL panel; assert max(pred_CPR) < 0.75.
+  Layer 2: Tail-blowup detector — score the FULL panel; assert max(pred_CPR) < 0.90
+           (V7.1 raised the SMM cap from 0.10 to 0.15 — CPR cap from 72% to 84%).
   Layer 3: SanCap benchmark grid — flag any scenario diverging > 10pp.
 
 Layers 1 & 2 are HARD pass/fail. Layer 3 is informational (V7 may legitimately
@@ -52,10 +53,14 @@ def derive_features_for_sample(s):
         msle = 0
     cum_itm = float(s.get('cum_itm', 0))
     burn_ratio = min(1.0, max(0.0, cum_itm / max(1.0, age)))
+    grf = float(s['loan_rate']) * 100 - float(s['plc_rate_bps'])
+    ppp = float(s.get('prepay_penalty_points', 0) or 0)
+    net_refi = grf - 12.5 * (ppp + 1)
     return {
         'loan_age_months':          np.array([age]),
-        'gross_refi_incentive_bps': np.array([float(s['loan_rate']) * 100 - float(s['plc_rate_bps'])]),
-        'prepay_penalty_points':    np.array([float(s.get('prepay_penalty_points', 0) or 0)]),
+        'net_refi_incentive_bps':   np.array([net_refi]),
+        'gross_refi_incentive_bps': np.array([grf]),
+        'prepay_penalty_points':    np.array([ppp]),
         'log_upb':                  np.array([math.log1p(upb)]),
         'fha_category':             np.array([str(s.get('fha_category', ''))]),
         'loan_purpose':             np.array([str(s.get('loan_purpose', ''))]),
@@ -73,10 +78,12 @@ def layer1():
     sample = sample[sample['loan_age_months'].notna() & sample['vintage_year'].notna()].reset_index(drop=True)
 
     # Loan_Snapshot column layout (must match build_excel_v7.py)
-    n_id, n_input, n_derived, n_mult = 8, 11, 2, 10
-    COL_SUMM_START = 1 + n_id + n_input + n_derived + n_mult   # = 32
-    PRED_CPR_COL = COL_SUMM_START + 2                          # = 34
-    SANITY_COL = COL_SUMM_START + 3 + 9                        # = 44
+    # V7.2: 8 multipliers + M_issuer = 9 mult cols; 3 derived (added net_refi_bps);
+    # 8 attribution cols (no M_penalty).
+    n_id, n_input, n_derived, n_mult, n_attr = 8, 11, 3, 9, 8
+    COL_SUMM_START = 1 + n_id + n_input + n_derived + n_mult
+    PRED_CPR_COL = COL_SUMM_START + 2
+    SANITY_COL = COL_SUMM_START + 3 + n_attr
     PRED_CPR_LETTER = get_column_letter(PRED_CPR_COL)
     SANITY_LETTER = get_column_letter(SANITY_COL)
     DATA_START_ROW = 3
@@ -158,9 +165,17 @@ def layer2():
     df['loan_age_months']          = df['loan_age_months'].fillna(0).clip(lower=0).astype(float)
     df['fha_category']             = df['fha_category'].fillna('').astype(str)
     df['loan_purpose']             = df['loan_purpose'].fillna('').astype(str)
+    if 'refi_incentive_bps' in df.columns:
+        df['net_refi_incentive_bps'] = df['refi_incentive_bps'].astype(float).fillna(
+            df['gross_refi_incentive_bps'] - 12.5 * (df['prepay_penalty_points'] + 1)
+        )
+    else:
+        df['net_refi_incentive_bps'] = (df['gross_refi_incentive_bps']
+                                         - 12.5 * (df['prepay_penalty_points'] + 1)).astype(float)
 
     feats = {
         'loan_age_months':          df['loan_age_months'].values,
+        'net_refi_incentive_bps':   df['net_refi_incentive_bps'].values,
         'gross_refi_incentive_bps': df['gross_refi_incentive_bps'].values,
         'prepay_penalty_points':    df['prepay_penalty_points'].values,
         'log_upb':                  df['log_upb'].values,
@@ -173,15 +188,17 @@ def layer2():
     smm = v7m.predict_smm(feats, params)
     cpr = (1 - (1 - smm) ** 12) * 100
     max_cpr = float(cpr.max())
+    n_above_90 = int((cpr > 90).sum())
     n_above_75 = int((cpr > 75).sum())
     n_above_60 = int((cpr > 60).sum())
     print(f"  n loans scored: {len(cpr):,}")
     print(f"  max(pred_CPR) = {max_cpr:.2f}%")
-    print(f"  count(pred_CPR > 75%) = {n_above_75:,}  count(pred_CPR > 60%) = {n_above_60:,}")
-    if max_cpr < 75 and n_above_75 == 0:
+    print(f"  count(pred_CPR > 90%) = {n_above_90:,}  > 75% = {n_above_75:,}  > 60% = {n_above_60:,}")
+    # V7.1 threshold: 90% (cap is now CPR=84%, so anything > 90% is a real anomaly)
+    if max_cpr < 90 and n_above_90 == 0:
         print("  PASS (no V6F-style blowups)")
         return True
-    print("  FAIL — V7 has re-introduced blowup behavior")
+    print("  FAIL — V7 predicts loan-months above the 90% CPR threshold")
     return False
 
 

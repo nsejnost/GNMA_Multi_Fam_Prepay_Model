@@ -31,21 +31,26 @@ LOG_UPB_ANCHOR = math.log1p(2_000_000)   # = ln(1 + $2M); matches small_loan thr
 
 INITIAL_PARAMS: dict = {
     'base_smm':  0.0186,                  # CPR ≈ 20% baseline; calibrated post-fit
-    'smm_cap':   0.10,                    # CPR ≈ 72%; structural blowup guard
+    'smm_cap':   0.15,                    # CPR ≈ 84%; structural blowup guard (raised from 0.10 in V7.1)
     'M_age': {
         'knots_x': [0.0, 12.0, 36.0, 96.0, 180.0, 360.0],
         'knots_y': [0.30, 0.65, 1.00, 1.40, 1.20, 0.70],
     },
-    'M_rate':     {'floor': 0.30, 'asymptote': 4.0, 'mid': 50.0, 'slope': 40.0},
-    'M_penalty':  {'floor': 0.20, 'slope': -0.10, 'ppp_mean': 5.0},
+    # M_rate: 4-param sigmoid on net (penalty-adjusted) refi incentive in bp.
+    # The panel's `refi_incentive_bps` is gross_refi_bps − penalty_bps_equivalent
+    # (penalty translation: 12.5 × (ppp + 1) bp). This collapses the V7.0
+    # M_rate × M_penalty product into a single bp-space subtraction — the
+    # standard "borrower compares net savings to penalty" formulation from
+    # SanCap and Yield Book.
+    'M_rate':     {'floor': 0.30, 'asymptote': 4.0, 'mid': 0.0, 'slope': 40.0},
     'M_size':     {'intercept': 0.6, 'slope': 0.25,
                    'log_upb_anchor': LOG_UPB_ANCHOR, 'low': 0.5, 'high': 1.8},
     'M_program':  {'232': 0.50, '538': 0.30, '223a7': 1.20,
                    '223f': 1.0, 'default': 1.0},
-    'M_purpose':  {'NC_bump': 0.6, 'NC_decay': 60.0},
+    'M_purpose':  {'NC_bump': 0.6, 'peak_age': 30.0, 'width': 24.0},
     'M_lockout':  {'amplitude': 1.0, 'tau': 4.0},
     'M_maturity': {'amplitude': 3.0, 'cutoff': 24.0},
-    'M_burnout':  {'floor': 0.50, 'slope': 0.50},
+    'M_burnout':  {'floor': 0.50, 'slope': -0.50},   # slope < 0 = "running-ITM amplifier"
 }
 
 
@@ -59,22 +64,18 @@ def m_age(age_months: np.ndarray, p: Mapping) -> np.ndarray:
                      left=p['knots_y'][0], right=p['knots_y'][-1])
 
 
-def m_rate(grf_bps: np.ndarray, p: Mapping) -> np.ndarray:
-    """4-parameter sigmoid S-curve on penalty-NEUTRAL gross refi incentive (bp)."""
-    x = np.asarray(grf_bps, dtype=float)
+def m_rate(net_refi_bps: np.ndarray, p: Mapping) -> np.ndarray:
+    """4-parameter sigmoid S-curve on NET (penalty-adjusted) refi incentive (bp).
+
+    Input is the panel's `refi_incentive_bps` = gross_refi_bps − penalty_bps_equivalent
+    where penalty_bps_equivalent ≈ 12.5 × (ppp + 1). With this formulation, M_penalty
+    is no longer needed as a separate multiplier — penalty enters as a bp-space
+    deductible inside M_rate's input (the standard SanCap / Yield Book formulation).
+    """
+    x = np.asarray(net_refi_bps, dtype=float)
     z = -(x - p['mid']) / p['slope']
     z = np.clip(z, -50, 50)        # numerical safety on exp
     return p['floor'] + p['asymptote'] / (1.0 + np.exp(z))
-
-
-def m_penalty(ppp: np.ndarray, p: Mapping) -> np.ndarray:
-    """Bounded linear penalty multiplier centered at panel-mean ppp.
-
-    M = max(floor, 1 + slope · (ppp − ppp_mean)). Slope must be ≤ 0 (deterrent).
-    """
-    x = np.asarray(ppp, dtype=float)
-    raw = 1.0 + p['slope'] * (x - p['ppp_mean'])
-    return np.maximum(p['floor'], raw)
 
 
 def m_size(log_upb: np.ndarray, p: Mapping) -> np.ndarray:
@@ -120,11 +121,16 @@ def m_program(fha_code: np.ndarray, p: Mapping) -> np.ndarray:
 
 
 def m_purpose(is_nc: np.ndarray, age_months: np.ndarray, p: Mapping) -> np.ndarray:
-    """Vectorized NC bump on integer is_nc flag."""
+    """Triangular-hump NC bump centered at peak_age, half-width `width`.
+
+    Form: 1 + NC_bump × max(0, 1 - |age - peak_age|/width) for NC loans, else 1.0.
+    The hump shape (vs the previous monotone-decay form) lets the optimizer find
+    the empirical peak around the CLC→PLC conversion window (age 24-48m).
+    """
     nc = np.asarray(is_nc, dtype=np.int64)
     age = np.asarray(age_months, dtype=float)
-    decay = np.maximum(0.0, 1.0 - age / p['NC_decay'])
-    bump = 1.0 + p['NC_bump'] * decay
+    hump = np.maximum(0.0, 1.0 - np.abs(age - p['peak_age']) / p['width'])
+    bump = 1.0 + p['NC_bump'] * hump
     return np.where(nc == 1, bump, 1.0)
 
 
@@ -158,7 +164,7 @@ def m_burnout(burn_ratio: np.ndarray, p: Mapping) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Composition (apply all multipliers, cap, annualize)
 # ---------------------------------------------------------------------------
-MULTIPLIER_NAMES = ['M_age', 'M_rate', 'M_penalty', 'M_size',
+MULTIPLIER_NAMES = ['M_age', 'M_rate', 'M_size',
                     'M_program', 'M_purpose', 'M_lockout', 'M_maturity', 'M_burnout']
 
 
@@ -166,7 +172,7 @@ def compute_multipliers(features: dict, params: Mapping) -> dict[str, np.ndarray
     """Return a dict of arrays keyed by multiplier name.
 
     `features` is a dict of arrays with these keys:
-       loan_age_months, gross_refi_incentive_bps, prepay_penalty_points,
+       loan_age_months, net_refi_incentive_bps (= panel's refi_incentive_bps),
        log_upb, fha_code (or fha_category), is_nc (or loan_purpose),
        months_since_lockout_end, months_to_maturity, burn_ratio
 
@@ -180,10 +186,13 @@ def compute_multipliers(features: dict, params: Mapping) -> dict[str, np.ndarray
     is_nc = features.get('is_nc')
     if is_nc is None:
         is_nc = encode_is_nc(features['loan_purpose'])
+    # Backwards-compatibility shim: accept either net_refi or gross_refi key
+    net_refi = features.get('net_refi_incentive_bps')
+    if net_refi is None:
+        net_refi = features['gross_refi_incentive_bps']     # deprecated path
     return {
-        'M_age':     m_age     (features['loan_age_months'],          params['M_age']),
-        'M_rate':    m_rate    (features['gross_refi_incentive_bps'], params['M_rate']),
-        'M_penalty': m_penalty (features['prepay_penalty_points'],    params['M_penalty']),
+        'M_age':     m_age     (features['loan_age_months'],         params['M_age']),
+        'M_rate':    m_rate    (net_refi,                             params['M_rate']),
         'M_size':    m_size    (features['log_upb'],                  params['M_size']),
         'M_program': m_program (fha_code,                              params['M_program']),
         'M_purpose': m_purpose (is_nc, features['loan_age_months'],   params['M_purpose']),
@@ -248,8 +257,9 @@ def pack_params(params: Mapping) -> tuple[np.ndarray, list]:
             raise ValueError(transform)
         schema.append((path, transform))
 
-    # base_smm: bounded (0.0001, 0.05)
-    push(params['base_smm'], ('base_smm',), 'bounded:0.0001,0.05')
+    # base_smm: bounded (0.0001, 0.10) — wide enough for the empirical fit
+    # to land freely; post-fit re-anchor (R3) brings it close to panel mean.
+    push(params['base_smm'], ('base_smm',), 'bounded:0.0001,0.10')
 
     # M_age knots_y: each in (0.05, 5.0)
     for i, y in enumerate(params['M_age']['knots_y']):
@@ -261,10 +271,6 @@ def pack_params(params: Mapping) -> tuple[np.ndarray, list]:
     push(params['M_rate']['mid'],       ('M_rate', 'mid'),       'free')
     push(params['M_rate']['slope'],     ('M_rate', 'slope'),     'log')   # > 0
 
-    # M_penalty: floor bounded, slope must be < 0 → fit -slope > 0 via log
-    push(params['M_penalty']['floor'], ('M_penalty', 'floor'), 'bounded:0.05,0.95')
-    push(params['M_penalty']['slope'], ('M_penalty', 'slope'), 'neglog')
-
     # M_size: smooth log (intercept free, slope free, low/high frozen at seed)
     push(params['M_size']['intercept'], ('M_size', 'intercept'), 'free')
     push(params['M_size']['slope'],     ('M_size', 'slope'),     'free')
@@ -273,9 +279,10 @@ def pack_params(params: Mapping) -> tuple[np.ndarray, list]:
     for k in ['232', '538', '223a7', '223f', 'default']:
         push(params['M_program'][k], ('M_program', k), 'bounded:0.05,5.0')
 
-    # M_purpose
-    push(params['M_purpose']['NC_bump'],  ('M_purpose', 'NC_bump'),  'bounded:0.0,3.0')
-    push(params['M_purpose']['NC_decay'], ('M_purpose', 'NC_decay'), 'log')   # > 0
+    # M_purpose (triangular hump): bump bounded; peak_age and width positive
+    push(params['M_purpose']['NC_bump'],  ('M_purpose', 'NC_bump'),  'bounded:0.0,5.0')
+    push(params['M_purpose']['peak_age'], ('M_purpose', 'peak_age'), 'log')   # > 0 (months)
+    push(params['M_purpose']['width'],    ('M_purpose', 'width'),    'log')   # > 0 (months)
 
     # M_lockout
     push(params['M_lockout']['amplitude'], ('M_lockout', 'amplitude'), 'bounded:0.0,4.0')
@@ -285,11 +292,45 @@ def pack_params(params: Mapping) -> tuple[np.ndarray, list]:
     push(params['M_maturity']['amplitude'], ('M_maturity', 'amplitude'), 'bounded:0.0,8.0')
     push(params['M_maturity']['cutoff'],    ('M_maturity', 'cutoff'),    'log')
 
-    # M_burnout: floor bounded, slope > 0 via log
+    # M_burnout: floor bounded; slope is "free" (data chooses sign).
+    # In our 2018-2026 panel, fitted slope < 0 means burn_ratio acts as a
+    # running-ITM amplifier, not a burnout dampener.
     push(params['M_burnout']['floor'], ('M_burnout', 'floor'), 'bounded:0.05,0.95')
-    push(params['M_burnout']['slope'], ('M_burnout', 'slope'), 'log')
+    push(params['M_burnout']['slope'], ('M_burnout', 'slope'), 'free')
 
     return np.array(theta), schema
+
+
+def assert_no_pinned_params(theta: np.ndarray, schema: list, tol: float = 0.02) -> list:
+    """Walk the schema, decode each parameter back to its constrained value, and
+    flag any that sit within `tol` (fraction of bound width) of either bound.
+    Returns a list of human-readable warning strings (empty if all clear).
+
+    For 'log'/'neglog'/'free' transforms there's no upper bound, so we only flag
+    'bounded:lo,hi' parameters. We additionally flag 'log'/'neglog' values whose
+    decoded magnitude is < 1e-6 (effectively zero — the multiplier is dead).
+    """
+    issues = []
+    for val, (path, transform) in zip(theta, schema):
+        path_str = '.'.join(str(p) for p in path)
+        v = float(val)
+        if transform.startswith('bounded:'):
+            lo, hi = [float(x) for x in transform.split(':')[1].split(',')]
+            sigval = lo + (hi - lo) / (1.0 + math.exp(-v))
+            frac_from_lo = (sigval - lo) / (hi - lo)
+            if frac_from_lo < tol:
+                issues.append(f"{path_str} pinned at LOWER bound {lo} (value={sigval:.5f})")
+            elif frac_from_lo > 1 - tol:
+                issues.append(f"{path_str} pinned at UPPER bound {hi} (value={sigval:.5f})")
+        elif transform == 'log':
+            decoded = math.exp(v)
+            if decoded < 1e-6:
+                issues.append(f"{path_str} fit to ~0 (value={decoded:.2e}) — multiplier likely dead")
+        elif transform == 'neglog':
+            decoded = -math.exp(v)
+            if abs(decoded) < 1e-6:
+                issues.append(f"{path_str} fit to ~0 (value={decoded:.2e}) — multiplier likely dead")
+    return issues
 
 
 def unpack_params(theta: np.ndarray, schema: list, template: Mapping) -> dict:

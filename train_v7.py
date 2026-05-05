@@ -101,12 +101,23 @@ def derive_features(df: pd.DataFrame) -> pd.DataFrame:
     df['fha_category']             = df['fha_category'].fillna('').astype(str)
     df['loan_purpose']             = df['loan_purpose'].fillna('').astype(str)
 
+    # R8: net (penalty-adjusted) refi incentive — feeds the single M_rate sigmoid.
+    # The panel column `refi_incentive_bps` is already gross_refi_bps − penalty_bps_eq
+    # (penalty translation: 12.5 × (ppp + 1) bp; verified from panel directly).
+    if 'refi_incentive_bps' in df.columns:
+        df['net_refi_incentive_bps'] = df['refi_incentive_bps'].astype(float).fillna(
+            df['gross_refi_incentive_bps'] - 12.5 * (df['prepay_penalty_points'] + 1)
+        )
+    else:
+        df['net_refi_incentive_bps'] = (df['gross_refi_incentive_bps']
+                                         - 12.5 * (df['prepay_penalty_points'] + 1)).astype(float)
+
     # Pre-encode categorical features for fast vectorized lookups in MLE
     df['fha_code'] = v7m.encode_fha_code(df['fha_category'].values)
     df['is_nc']    = v7m.encode_is_nc(df['loan_purpose'].values)
 
     # Drop any remaining NaNs in the feature inputs
-    feat_cols = ['loan_age_months', 'gross_refi_incentive_bps', 'prepay_penalty_points',
+    feat_cols = ['loan_age_months', 'net_refi_incentive_bps', 'prepay_penalty_points',
                  'log_upb', 'months_since_lockout_end', 'months_to_maturity', 'burn_ratio']
     nans = df[feat_cols].isna().any(axis=1)
     if nans.any():
@@ -125,6 +136,7 @@ def features_dict(df: pd.DataFrame) -> dict:
     """
     return {
         'loan_age_months':          df['loan_age_months'].values,
+        'net_refi_incentive_bps':   df['net_refi_incentive_bps'].values,
         'gross_refi_incentive_bps': df['gross_refi_incentive_bps'].values,
         'prepay_penalty_points':    df['prepay_penalty_points'].values,
         'log_upb':                  df['log_upb'].values,
@@ -177,20 +189,117 @@ def neg_log_likelihood(theta: np.ndarray, schema, template, feats, y, sample_wei
     return -ll.sum()
 
 
-def stage2_fit(feats_train, y_train, init_params, max_iter=200):
+def stage2_fit(feats_train, y_train, init_params, max_iter=200, sample_weight=None):
+    """Joint Poisson/Bernoulli MLE via L-BFGS-B.
+
+    `sample_weight` is an optional per-row weight array. We use it to up-weight
+    post-lockout rows (R5) so the optimizer sees the ~9.5K-row 0-12m surge
+    signal despite competition from the 982K-row in-lockout/none signal.
+    """
     print("\nStage 2: joint Poisson/Bernoulli MLE (L-BFGS-B)...")
     theta0, schema = v7m.pack_params(init_params)
     print(f"  Free parameters: {len(theta0)}")
     print(f"  Train rows: {len(y_train):,}  events: {int(y_train.sum()):,}")
+    if sample_weight is not None:
+        n_up = int((sample_weight > 1.0).sum())
+        print(f"  Sample-weighted rows: {n_up:,}  (max weight: {float(sample_weight.max()):.1f})")
 
     def f(theta):
-        return neg_log_likelihood(theta, schema, init_params, feats_train, y_train)
+        return neg_log_likelihood(theta, schema, init_params, feats_train, y_train,
+                                  sample_weight=sample_weight)
 
     result = minimize(f, theta0, method='L-BFGS-B',
                       options={'maxiter': max_iter, 'disp': False})
     print(f"  Converged: {result.success}  iterations: {result.nit}  NLL: {result.fun:.4f}")
     fitted = v7m.unpack_params(result.x, schema, init_params)
-    return fitted, result
+
+    # R7: flag any parameter pinned at a bound or fit to ~0
+    issues = v7m.assert_no_pinned_params(result.x, schema)
+    if issues:
+        print("  WARNING: parameters at boundary or fit to ~0:")
+        for i in issues:
+            print(f"    - {i}")
+    else:
+        print("  All parameters fit within bounds (no pinning)")
+
+    return fitted, result, schema
+
+
+def reanchor_multipliers(params: dict, feats_train: dict) -> dict:
+    """R3: Re-parameterize so each scale-equivariant multiplier has panel-mean = 1.0.
+
+    For multipliers whose functional form is scale-equivariant (M_age piecewise
+    linear, M_rate sigmoid floor+asymp, M_program lookup, M_size clipped linear),
+    we can scale their parameters by a constant k to scale ALL their outputs by k.
+    By choosing k = 1/panel_mean(multiplier), each multiplier becomes mean-1.0
+    over the panel. We then absorb the products of those mean factors into
+    base_smm — predictions are mathematically unchanged.
+
+    M_penalty, M_purpose, M_lockout, M_maturity, M_burnout already average ~1.0
+    by construction (each is a "1 + ..." form), so we leave them alone.
+    """
+    import copy
+    out = copy.deepcopy(params)
+    mults_before = v7m.compute_multipliers(feats_train, out)
+
+    print("\nR3: re-anchoring scale-equivariant multipliers to panel-mean=1.0")
+    print(f"  base_smm before: {out['base_smm']:.5f}")
+    base_factor = 1.0
+
+    # M_age: piecewise linear (scale knots_y by k)
+    mean_age = float(mults_before['M_age'].mean())
+    if mean_age > 0:
+        k = mean_age
+        out['M_age']['knots_y'] = [y / k for y in out['M_age']['knots_y']]
+        base_factor *= k
+        print(f"  M_age:    panel mean = {mean_age:.4f}  →  knots_y / {k:.4f}")
+
+    # M_rate: sigmoid floor + asymp/(1+exp(...)) (scale floor and asymp by k)
+    mean_rate = float(mults_before['M_rate'].mean())
+    if mean_rate > 0:
+        k = mean_rate
+        out['M_rate']['floor']     /= k
+        out['M_rate']['asymptote'] /= k
+        base_factor *= k
+        print(f"  M_rate:   panel mean = {mean_rate:.4f}  →  floor & asymp / {k:.4f}")
+
+    # M_program: lookup table (scale every value by k)
+    mean_prog = float(mults_before['M_program'].mean())
+    if mean_prog > 0:
+        k = mean_prog
+        for key in out['M_program']:
+            out['M_program'][key] /= k
+        base_factor *= k
+        print(f"  M_program: panel mean = {mean_prog:.4f}  →  all entries / {k:.4f}")
+
+    # M_size: clipped linear (scale intercept, slope, low, high by k)
+    mean_size = float(mults_before['M_size'].mean())
+    if mean_size > 0:
+        k = mean_size
+        out['M_size']['intercept'] /= k
+        out['M_size']['slope']     /= k
+        out['M_size']['low']       /= k
+        out['M_size']['high']      /= k
+        base_factor *= k
+        print(f"  M_size:    panel mean = {mean_size:.4f}  →  intercept/slope/low/high / {k:.4f}")
+
+    # Absorb the product of panel means into base_smm
+    out['base_smm'] *= base_factor
+    print(f"  base_smm after: {out['base_smm']:.5f}  (× {base_factor:.4f})")
+
+    # Sanity-check: predictions must be unchanged
+    smm_before = v7m.predict_smm(feats_train, params)
+    smm_after  = v7m.predict_smm(feats_train, out)
+    diff = float(np.abs(smm_after - smm_before).max())
+    print(f"  Max |smm_before - smm_after| (should be near 0): {diff:.2e}")
+
+    # Verify each rescaled multiplier now averages ~1.0
+    mults_after = v7m.compute_multipliers(feats_train, out)
+    for name in ['M_age', 'M_rate', 'M_program', 'M_size']:
+        m = float(mults_after[name].mean())
+        print(f"  {name} new panel mean: {m:.4f}")
+
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -234,9 +343,6 @@ def stage1_refine(df_train: pd.DataFrame, params: dict, n_passes: int = 3) -> di
             elif target == 'M_age':
                 p['M_age']['knots_y'] = [float(np.clip(y_ * scalar, 0.05, 5.0))
                                           for y_ in p['M_age']['knots_y']]
-            elif target == 'M_penalty':
-                # Adjusting penalty's bounded linear by nudging slope (preserve floor)
-                p['M_penalty']['slope'] = float(np.clip(p['M_penalty']['slope'] / scalar, -1.0, -0.001))
             elif target == 'M_size':
                 p['M_size']['intercept'] = float(np.clip(p['M_size']['intercept'] * scalar, 0.1, 3.0))
             elif target == 'M_program':
@@ -365,10 +471,10 @@ def build_bucket_cuts(df, col, edges, labels, params):
 def build_multiplier_curves(params: dict) -> dict:
     """Render each numeric multiplier's curve over its input range — for the dashboard."""
     curves = {}
+    # M_rate now plots over the NET (penalty-adjusted) refi incentive domain
     grids = {
         'M_age':      np.linspace(0, 360, 60),
-        'M_rate':     np.linspace(-400, 600, 50),
-        'M_penalty':  np.linspace(0, 10, 21),
+        'M_rate':     np.linspace(-500, 500, 50),    # net_refi_bps domain
         'M_size':     np.linspace(np.log1p(5e5), np.log1p(1e8), 40),
         'M_lockout':  np.linspace(0, 24, 25),
         'M_maturity': np.linspace(0, 60, 30),
@@ -377,7 +483,6 @@ def build_multiplier_curves(params: dict) -> dict:
     fns = {
         'M_age':      v7m.m_age,
         'M_rate':     v7m.m_rate,
-        'M_penalty':  v7m.m_penalty,
         'M_size':     v7m.m_size,
         'M_lockout':  v7m.m_lockout,
         'M_maturity': v7m.m_maturity,
@@ -390,13 +495,16 @@ def build_multiplier_curves(params: dict) -> dict:
     # Categorical multipliers as bar tables
     curves['M_program'] = [{'x': k, 'y': round(float(v), 4)}
                             for k, v in params['M_program'].items()]
+    # M_purpose now a triangular hump centered at peak_age over the NC age domain
+    pa = params['M_purpose']['peak_age']; w = params['M_purpose']['width']
+    bump = params['M_purpose']['NC_bump']
+    nc_ages = sorted(set([0, max(0, pa - w), pa - w/2, pa, pa + w/2, pa + w, 90, 120]))
     curves['M_purpose'] = [
-        {'x': 'NC@age=0',  'y': round(float(1.0 + params['M_purpose']['NC_bump']), 4)},
-        {'x': 'NC@age=30', 'y': round(float(1.0 + params['M_purpose']['NC_bump'] *
-                                              max(0, 1 - 30/params['M_purpose']['NC_decay'])), 4)},
-        {'x': 'NC@age=60', 'y': 1.0},
-        {'x': 'RP/OTHER',  'y': 1.0},
+        {'x': f'NC@age={int(round(a))}m',
+         'y': round(float(1.0 + bump * max(0, 1 - abs(a - pa) / w)), 4)}
+        for a in nc_ages
     ]
+    curves['M_purpose'].append({'x': 'RP/OTHER', 'y': 1.0})
     return curves
 
 
@@ -509,12 +617,17 @@ def sancap_benchmark_grid(params: dict) -> list:
     for label, grf, ppp, upb, prog, purp, age, mtm, br, sancap_target in scenarios:
         # msle for the post-lockout scenario only
         msle = 2 if 'post-lockout' in label else 0
+        net_refi = float(grf) - 12.5 * (float(ppp) + 1)
+        # Translate program name to fha_code: SanCap uses '232', '538', '223(f)', etc.;
+        # the panel uses bare-key form '232', '538', '223f', etc.
+        prog_panel = prog.replace('(f)', 'f').replace('(a)(7)', 'a7')
         feats = {
             'loan_age_months':          np.array([float(age)]),
+            'net_refi_incentive_bps':   np.array([net_refi]),
             'gross_refi_incentive_bps': np.array([float(grf)]),
             'prepay_penalty_points':    np.array([float(ppp)]),
             'log_upb':                  np.array([float(np.log1p(upb))]),
-            'fha_category':             np.array([prog]),
+            'fha_category':             np.array([prog_panel]),
             'loan_purpose':             np.array([purp]),
             'months_since_lockout_end': np.array([float(msle)]),
             'months_to_maturity':       np.array([float(mtm)]),
@@ -593,26 +706,41 @@ def main():
     print(f"  Train rows: {len(df_train):,}  events: {int(df_train['prepaid_voluntary'].sum()):,}")
     print(f"  Test  rows: {len(df_test):,}  events: {int(df_test['prepaid_voluntary'].sum()):,}")
 
-    # Initial params: use the seed values, but override ppp_mean with panel mean
+    # Initial params: use the seed values
     init = copy.deepcopy(v7m.INITIAL_PARAMS)
-    init['M_penalty']['ppp_mean'] = float(df_train['prepay_penalty_points'].mean())
 
     # Stage 1: empirical refinement on full train set (no downsampling)
     feats_train = features_dict(df_train)
     y_train = df_train['prepaid_voluntary'].astype(float).values
     params_s1 = stage1_refine(df_train, init, n_passes=3)
 
-    # Stage 2: joint MLE on the FULL train set (no downsampling).
+    # R5: build sample weights — up-weight 0-12m post-lockout rows so the
+    # optimizer notices the ~9.5K-row post-lockout signal against 982K rows of
+    # in-lockout/none.
+    sample_weights = np.ones_like(y_train)
+    msle_arr = feats_train['months_since_lockout_end']
+    post_lockout_mask = (msle_arr > 0) & (msle_arr <= 12)
+    sample_weights[post_lockout_mask] = 50.0
+    print(f"\nSample weighting: {int(post_lockout_mask.sum()):,} post-lockout rows weighted 50×")
+
+    # Stage 2: joint MLE on the FULL train set (no downsampling), with R5 weights.
     # Reasoning: Bernoulli MLE on rare events is well-behaved with proper
     # likelihood; downsampling biases multipliers up by ~(neg_ratio+1)x because
     # post-fit base-SMM correction can only adjust the constant, not the
     # multipliers that absorbed the inflated prevalence.
-    params_s2, opt_result = stage2_fit(feats_train, y_train, params_s1, max_iter=300)
+    params_s2, opt_result, schema = stage2_fit(feats_train, y_train, params_s1,
+                                                max_iter=300, sample_weight=sample_weights)
     # Final calibration nudge on base_smm only (small correction; should be ~1.0)
     pred_full = v7m.predict_smm(feats_train, params_s2)
     correction = float(y_train.sum() / max(pred_full.sum(), 1e-9))
-    params_s2['base_smm'] = float(np.clip(params_s2['base_smm'] * correction, 1e-5, 0.05))
+    params_s2['base_smm'] = float(np.clip(params_s2['base_smm'] * correction, 1e-5, 0.10))
     print(f"\nFinal base-SMM nudge: × {correction:.4f}  → base_smm = {params_s2['base_smm']:.5f}")
+
+    # R3: re-anchor scale-equivariant multipliers (M_age, M_rate, M_program,
+    # M_size) to have panel-mean = 1.0. Absorbs the panel mean of each into
+    # base_smm. Predictions are unchanged; per-multiplier values become
+    # interpretable as "factor relative to the average loan".
+    params_s2 = reanchor_multipliers(params_s2, feats_train)
 
     # Final test-set diagnostics
     feats_test = features_dict(df_test)
@@ -627,7 +755,9 @@ def main():
     cpr_full = smm_to_cpr(pred_full_panel)
     max_cpr = float(cpr_full.max())
     n_above_75 = int((cpr_full > 75).sum())
-    print(f"Tail-blowup check: max(pred_CPR over full panel) = {max_cpr:.2f}%  (n>75% = {n_above_75})")
+    n_above_90 = int((cpr_full > 90).sum())
+    print(f"Tail-blowup check: max(pred_CPR over full panel) = {max_cpr:.2f}%  "
+          f"(n>90% = {n_above_90}; n>75% = {n_above_75})")
 
     # SanCap benchmark grid (Layer 3, informational)
     grid = sancap_benchmark_grid(params_s2)
@@ -681,6 +811,7 @@ def main():
             'description':      'V7 multiplicative voluntary prepayment model (9 bounded multipliers)',
             'max_cpr_full_panel': round(max_cpr, 2),
             'n_above_75_cpr':   n_above_75,
+            'n_above_90_cpr':   n_above_90,
             'smm_cap':          float(params_s2['smm_cap']),
             'feature_list':     v7m.MULTIPLIER_NAMES,
             'feature_labels':   {n: n.replace('M_', '') for n in v7m.MULTIPLIER_NAMES},

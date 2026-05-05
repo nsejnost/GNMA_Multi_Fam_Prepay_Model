@@ -138,8 +138,9 @@ def build_readme(wb, md):
          f"(SMM cap: {md['metadata']['smm_cap']:.3f})", None),
         ("", None),
         ("Architecture", BOLD),
-        ("  predicted_SMM = MIN(base_SMM × M_age × M_rate × M_penalty × M_size", MONO),
-        ("                   × M_program × M_purpose × M_lockout × M_maturity × M_burnout, smm_cap)", MONO),
+        ("  predicted_SMM = MIN(base_SMM × M_age × M_rate × M_size × M_program", MONO),
+        ("                   × M_purpose × M_lockout × M_maturity × M_burnout, smm_cap)", MONO),
+        ("  M_rate input = net_refi_bps = gross_refi_bps - 12.5 × (ppp + 1)  ← penalty bp-deductible", MONO),
         ("  predicted_CPR = 1 - (1 - predicted_SMM)^12", MONO),
         ("", None),
         ("Tabs", BOLD),
@@ -218,12 +219,6 @@ def build_multiplier_params(wb, params, md):
     write("  slope",     params['M_rate']['slope'],     'V7_RATE_SLOPE',     "0.0000")
     row += 1
 
-    ws.cell(row, 1, "M_penalty (max(floor, 1 + slope*(ppp - ppp_mean)))"); ws.cell(row, 1).font = BOLD; row += 1
-    write("  floor",     params['M_penalty']['floor'],    'V7_PEN_FLOOR',    "0.0000")
-    write("  slope",     params['M_penalty']['slope'],    'V7_PEN_SLOPE',    "0.000000")
-    write("  ppp_mean",  params['M_penalty']['ppp_mean'], 'V7_PEN_PPP_MEAN', "0.0000")
-    row += 1
-
     ws.cell(row, 1, "M_size (smooth log on log_upb)"); ws.cell(row, 1).font = BOLD; row += 1
     write("  intercept",        params['M_size']['intercept'],      'V7_SIZE_INTERCEPT',  "0.0000")
     write("  slope",            params['M_size']['slope'],          'V7_SIZE_SLOPE',      "0.000000")
@@ -232,9 +227,10 @@ def build_multiplier_params(wb, params, md):
     write("  high (clip)",      params['M_size']['high'],           'V7_SIZE_HIGH',       "0.0000")
     row += 1
 
-    ws.cell(row, 1, "M_purpose (NC bump, age-decayed)"); ws.cell(row, 1).font = BOLD; row += 1
+    ws.cell(row, 1, "M_purpose (NC triangular hump centered at peak_age)"); ws.cell(row, 1).font = BOLD; row += 1
     write("  NC_bump",  params['M_purpose']['NC_bump'],  'V7_PURPOSE_NC_BUMP',  "0.0000")
-    write("  NC_decay", params['M_purpose']['NC_decay'], 'V7_PURPOSE_NC_DECAY', "0.00")
+    write("  peak_age", params['M_purpose']['peak_age'], 'V7_PURPOSE_PEAK_AGE', "0.00")
+    write("  width",    params['M_purpose']['width'],    'V7_PURPOSE_WIDTH',    "0.00")
     row += 1
 
     ws.cell(row, 1, "M_lockout (1 + amp*exp(-msle/tau) for msle ∈ (0,12])"); ws.cell(row, 1).font = BOLD; row += 1
@@ -340,7 +336,7 @@ def build_loan_snapshot(wb, sample, params, param_cells, lookup_cells):
     INPUT_COLS = ["upb", "loan_rate_pct", "plc_rate_bps", "prepay_penalty_points",
                   "loan_age_months", "cum_itm", "loan_maturity_yyyymm", "lockout_end_yyyymm",
                   "issuer_number", "burn_ratio_in", "is_NC_in"]
-    DERIVED_COLS = ["log_upb", "gross_refi_bps"]
+    DERIVED_COLS = ["log_upb", "gross_refi_bps", "net_refi_bps"]
     MULT_COLS = list(v7m.MULTIPLIER_NAMES) + ["M_issuer"]   # 10 (issuer is overlay)
     SUMMARY_COLS = ["product", "capped_SMM", "pred_CPR"]
     ATTR_COLS = [f"attr_{n}" for n in v7m.MULTIPLIER_NAMES]   # 9 (issuer not in attribution; it's a post-hoc overlay)
@@ -420,11 +416,15 @@ def build_loan_snapshot(wb, sample, params, param_cells, lookup_cells):
         ws.cell(r, IN['burn_ratio_in'], br).number_format = "0.0000"
         ws.cell(r, IN['is_NC_in'], 1 if str(s.get('loan_purpose', '')).upper() == 'NC' else 0)
 
-        # Derived: log_upb, gross_refi_bps
+        # Derived: log_upb, gross_refi_bps, net_refi_bps (penalty-deductible)
         ws.cell(r, DR['log_upb'],
                 f"=LN(1+{cl(IN['upb'])}{r})").number_format = "0.000"
         ws.cell(r, DR['gross_refi_bps'],
                 f"={cl(IN['loan_rate_pct'])}{r}*100-{cl(IN['plc_rate_bps'])}{r}").number_format = "0.0"
+        # net_refi_bps = gross - 12.5*(ppp+1) — matches panel's `refi_incentive_bps` formula
+        ws.cell(r, DR['net_refi_bps'],
+                f"={cl(DR['gross_refi_bps'])}{r}-12.5*({cl(IN['prepay_penalty_points'])}{r}+1)"
+                ).number_format = "0.0"
 
         # ----- Multipliers (closed-form formulas) -----
 
@@ -448,16 +448,11 @@ def build_loan_snapshot(wb, sample, params, param_cells, lookup_cells):
         )
         ws.cell(r, M['M_age'], f_age).number_format = "0.0000"
 
-        # M_rate: 4-param sigmoid
-        grf_col = cl(DR['gross_refi_bps'])
+        # M_rate: 4-param sigmoid on NET refi bps (penalty already deducted)
+        net_col = cl(DR['net_refi_bps'])
         f_rate = (f"=V7_RATE_FLOOR+V7_RATE_ASYMPTOTE/"
-                  f"(1+EXP(-({grf_col}{r}-V7_RATE_MID)/V7_RATE_SLOPE))")
+                  f"(1+EXP(-({net_col}{r}-V7_RATE_MID)/V7_RATE_SLOPE))")
         ws.cell(r, M['M_rate'], f_rate).number_format = "0.0000"
-
-        # M_penalty: max(floor, 1 + slope*(ppp - ppp_mean))
-        ppp_col = cl(IN['prepay_penalty_points'])
-        f_pen = (f"=MAX(V7_PEN_FLOOR,1+V7_PEN_SLOPE*({ppp_col}{r}-V7_PEN_PPP_MEAN))")
-        ws.cell(r, M['M_penalty'], f_pen).number_format = "0.0000"
 
         # M_size: clip(intercept + slope*(log_upb - anchor), low, high)
         log_col = cl(DR['log_upb'])
@@ -488,10 +483,10 @@ def build_loan_snapshot(wb, sample, params, param_cells, lookup_cells):
         )
         ws.cell(r, M['M_program'], f_prog_simple).number_format = "0.0000"
 
-        # M_purpose: NC bump that decays linearly to 1.0 by NC_decay months
+        # M_purpose: triangular hump centered at peak_age, half-width `width`
         is_nc_col = cl(IN['is_NC_in'])
         f_purp = (f"=IF({is_nc_col}{r}=1,"
-                  f"1+V7_PURPOSE_NC_BUMP*MAX(0,1-{age_col}{r}/V7_PURPOSE_NC_DECAY),"
+                  f"1+V7_PURPOSE_NC_BUMP*MAX(0,1-ABS({age_col}{r}-V7_PURPOSE_PEAK_AGE)/V7_PURPOSE_WIDTH),"
                   f"1)")
         ws.cell(r, M['M_purpose'], f_purp).number_format = "0.0000"
 
@@ -535,7 +530,7 @@ def build_loan_snapshot(wb, sample, params, param_cells, lookup_cells):
         ws.cell(r, M['M_issuer'], f_iss).number_format = "0.0000"
 
         # ----- Summary block -----
-        # product = M_age × M_rate × M_penalty × M_size × M_program × M_purpose × M_lockout × M_maturity × M_burnout × M_issuer
+        # product = M_age × M_rate × M_size × M_program × M_purpose × M_lockout × M_maturity × M_burnout × M_issuer
         first_m = cl(M['M_age'])
         last_m  = cl(M['M_issuer'])
         ws.cell(r, SU['product'],
@@ -670,7 +665,8 @@ def build_deal_aggregator(wb, sample, params):
 def build_benchmarks_tab(wb, params, md):
     ws = wb.create_sheet("Benchmarks")
     ws.cell(1, 1, "SanCap (Amherst Pierpont 2014-2018) reference benchmarks vs V7").font = Font(bold=True, size=14)
-    ws.cell(2, 1, "Informational sanity check — V7 may legitimately diverge on the 2018-2026 panel.").font = Font(italic=True, color="6B7280")
+    ws.cell(2, 1, "Informational sanity check — V7 trains on the 2018-2026 panel which spans the 2022-2024 rate-hike cycle.").font = Font(italic=True, color="6B7280")
+    ws.cell(3, 1, "Persistent divergences in +50/+100bp scenarios reflect that regime shift, not a model defect. Use V7 as ground truth on this panel; SanCap is a shape-direction sanity check.").font = Font(italic=True, color="6B7280")
 
     grid = md.get('sancap_benchmarks', [])
     hdrs = ["Scenario", "SanCap CPR (2014-2018)", "V7 pred CPR", "Δ (pp)", "Flag"]
