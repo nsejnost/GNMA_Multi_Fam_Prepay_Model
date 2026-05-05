@@ -151,178 +151,255 @@ def train_split(df: pd.DataFrame, seed: int = SEED) -> tuple[np.ndarray, np.ndar
 
 
 # ---------------------------------------------------------------------------
-# Cohort fitting (the heart of V8)
+# Cohort fitting (the heart of V8) — joint sigmoid + age_ramp via iterative refinement
 # ---------------------------------------------------------------------------
-def _fit_one_cohort(net_bps: np.ndarray, actual_smm: np.ndarray,
-                     min_events: int = 5) -> tuple[dict, list, dict]:
-    """Bin loan-months on net_bps, compute mean actual_SMM per bin, fit the
-    4-param sigmoid via weighted least squares.
+def _sigmoid_func(x, floor, asymp, mid, slope):
+    z = np.clip(-(x - mid) / slope, -50, 50)
+    return floor + asymp / (1 + np.exp(z))
+
+
+def _fit_age_ramp(ages: np.ndarray, residual_ratio: np.ndarray,
+                   weights: np.ndarray | None = None) -> list:
+    """Fit the 4-knot piecewise-linear age ramp by binning ages and computing
+    the weighted mean of `residual_ratio` (= actual_smm / sigmoid_pred) at each
+    knot. Returns a list of 4 knot heights, with the anchor knot held at 1.0.
+    """
+    knots_x = c8.AGE_RAMP_KNOTS_X
+    knots_y = list(c8.AGE_RAMP_INITIAL_Y.copy())
+    if weights is None:
+        weights = np.ones_like(residual_ratio)
+
+    # Bucket each age to its NEAREST knot, then take a weighted mean of the
+    # residual_ratio for that bucket as the knot height.
+    nearest = np.argmin(np.abs(ages[:, None] - knots_x[None, :]), axis=1)
+    for k in range(len(knots_x)):
+        mask = nearest == k
+        if mask.sum() < 50:                          # leave seed value if sparse
+            continue
+        w = weights[mask]
+        knots_y[k] = float(np.clip(
+            np.average(residual_ratio[mask], weights=w), 0.05, 5.0))
+
+    # Anchor: divide all knots by the anchor's value so anchor knot = 1.0.
+    # This breaks the sigmoid×ramp scale ambiguity.
+    anchor = knots_y[c8.AGE_RAMP_ANCHOR_IDX]
+    if anchor > 1e-6:
+        knots_y = [float(y / anchor) for y in knots_y]
+    return knots_y
+
+
+def _fit_one_cohort(ages: np.ndarray, net_bps: np.ndarray, actual_smm: np.ndarray,
+                     min_events: int = 5, n_iters: int = 3) -> tuple[dict, list, list, dict]:
+    """Joint fit of sigmoid (on net_bps) + age_ramp (on ages) via iterative
+    refinement. The anchor-knot constraint (age=96m → ramp=1.0) absorbs the
+    scale ambiguity; the sigmoid params describe SMM at age=96m.
 
     Returns:
-        params       : {floor, asymp, mid, slope}
-        scatter      : [{bin_mid_bp, n, actual_smm, actual_cpr}, ...]
-        fit_summary  : {residual_std, fit_quality, asymp_pinned, ...}
+        params      : {floor, asymp, mid, slope, age_knots_y}
+        sig_scatter : [{bin_mid_bp, n, actual_smm, actual_cpr}] — net_refi scatter
+        age_scatter : [{bin_mid_age, n, actual_smm, actual_cpr, ramp_y}] — age scatter
+        fit_summary : diagnostics
     """
     n_total = len(net_bps)
     if actual_smm.sum() < min_events:
-        return None, [], {'fit_quality': 'too_few_events',
-                          'n': int(n_total), 'n_events': int(actual_smm.sum())}
+        return None, [], [], {'fit_quality': 'too_few_events',
+                               'n': int(n_total), 'n_events': int(actual_smm.sum())}
 
-    # Quantile bins on net_bps; require at least 12 distinct values
-    n_bins = min(N_BINS_PER_COHORT, max(3, int(n_total / 200)))
-    try:
-        bins = pd.qcut(net_bps, n_bins, labels=False, duplicates='drop')
-    except ValueError:
-        return None, [], {'fit_quality': 'binning_failed', 'n': int(n_total)}
+    # Initialize age ramp = identity
+    age_knots_y = list(c8.AGE_RAMP_INITIAL_Y.copy())
+    sig_params = None
+    sig_residual_std = None
+    sig_agg = None
 
-    # Aggregate per bin
-    df_bin = pd.DataFrame({'net_bp': net_bps, 'smm': actual_smm, 'bin': bins})
-    agg = df_bin.groupby('bin').agg(
-        n=('smm', 'size'),
-        actual_smm=('smm', 'mean'),
-        bin_mid_bp=('net_bp', 'mean'),
-    ).reset_index().sort_values('bin_mid_bp').reset_index(drop=True)
+    # Iterative refinement: alternate between sigmoid-on-rate-residual and ramp-on-age-residual
+    for it in range(n_iters):
+        # Step A: divide actual SMM by current age_ramp(age), then fit sigmoid on net_bps
+        ramp_per_row = np.interp(ages, c8.AGE_RAMP_KNOTS_X, age_knots_y,
+                                  left=age_knots_y[0], right=age_knots_y[-1])
+        adj_smm = actual_smm / np.maximum(ramp_per_row, 1e-3)
 
-    if len(agg) < 4:
-        return None, [], {'fit_quality': 'too_few_bins', 'n': int(n_total),
-                          'n_bins': int(len(agg))}
+        # Bin on net_bps and aggregate
+        n_bins = min(N_BINS_PER_COHORT, max(3, int(n_total / 200)))
+        try:
+            bins = pd.qcut(net_bps, n_bins, labels=False, duplicates='drop')
+        except ValueError:
+            return None, [], [], {'fit_quality': 'binning_failed', 'n': int(n_total)}
+        agg = (pd.DataFrame({'net_bp': net_bps, 'smm': adj_smm, 'bin': bins})
+                 .groupby('bin').agg(n=('smm', 'size'),
+                                       actual_smm=('smm', 'mean'),
+                                       bin_mid_bp=('net_bp', 'mean'))
+                 .reset_index().sort_values('bin_mid_bp').reset_index(drop=True))
+        if len(agg) < 4:
+            return None, [], [], {'fit_quality': 'too_few_bins', 'n': int(n_total)}
 
-    # Fit the sigmoid via curve_fit
-    def sigmoid(x, floor, asymp, mid, slope):
-        z = -(x - mid) / slope
-        z = np.clip(z, -50, 50)
-        return floor + asymp / (1 + np.exp(z))
+        seed = (c8.INITIAL_SIGMOID_SEED if sig_params is None
+                else {'floor': sig_params['floor'], 'asymp': sig_params['asymp'],
+                      'mid':   sig_params['mid'],   'slope': sig_params['slope']})
+        p0 = [seed['floor'], seed['asymp'], seed['mid'], seed['slope']]
+        sigma = 1.0 / np.maximum(np.sqrt(agg['n'].values), 1e-9)
+        try:
+            popt, _ = curve_fit(_sigmoid_func,
+                                 agg['bin_mid_bp'].values,
+                                 agg['actual_smm'].values,
+                                 p0=p0, sigma=sigma, bounds=c8.SIGMOID_BOUNDS,
+                                 maxfev=5000)
+        except Exception as exc:
+            return None, [], [], {'fit_quality': f'sigmoid_failed: {exc.__class__.__name__}',
+                                    'n': int(n_total)}
+        sig_params = {'floor': float(popt[0]), 'asymp': float(popt[1]),
+                      'mid':   float(popt[2]), 'slope': float(popt[3])}
+        sig_agg = agg.copy()
+        sig_residual_std = float(np.sqrt(np.average(
+            (agg['actual_smm'].values - _sigmoid_func(agg['bin_mid_bp'].values, *popt)) ** 2,
+            weights=agg['n'].values)))
 
-    seed = c8.INITIAL_SIGMOID_SEED
-    p0 = [seed['floor'], seed['asymp'], seed['mid'], seed['slope']]
-    weights = np.sqrt(agg['n'].values)
-    sigma = 1.0 / np.maximum(weights, 1e-9)
+        # Step B: divide actual SMM by current sigmoid(net_bps), then fit age ramp
+        sig_per_row = _sigmoid_func(net_bps, *popt)
+        residual_ratio = actual_smm / np.maximum(sig_per_row, 1e-9)
+        # Use loan-month count as weights (uniform here since each row is one loan-month)
+        age_knots_y = _fit_age_ramp(ages, residual_ratio,
+                                      weights=np.ones_like(residual_ratio))
 
-    try:
-        popt, pcov = curve_fit(
-            sigmoid, agg['bin_mid_bp'].values, agg['actual_smm'].values,
-            p0=p0, sigma=sigma, bounds=c8.SIGMOID_BOUNDS, maxfev=5000,
-        )
-    except Exception as exc:
-        return None, [], {'fit_quality': f'curve_fit_failed: {exc.__class__.__name__}',
-                          'n': int(n_total)}
+    # Final params + scatter
+    params = {**sig_params, 'age_knots_y': [float(y) for y in age_knots_y]}
 
-    floor_v, asymp_v, mid_v, slope_v = popt.tolist()
-    params = {'floor': float(floor_v), 'asymp': float(asymp_v),
-              'mid':   float(mid_v),   'slope': float(slope_v)}
-
-    # Compute residuals at the bin level
-    pred_at_bins = sigmoid(agg['bin_mid_bp'].values, *popt)
-    residuals = agg['actual_smm'].values - pred_at_bins
-    residual_std = float(np.sqrt(np.average(residuals**2, weights=agg['n'].values)))
-
-    # Pinning checks
-    lo_b, hi_b = c8.SIGMOID_BOUNDS
-    asymp_pinned = (asymp_v < lo_b[1] + 1e-4) or (asymp_v > hi_b[1] - 1e-4)
-    floor_pinned = (floor_v < lo_b[0] + 1e-5) or (floor_v > hi_b[0] - 1e-5)
-
-    quality = 'good'
-    if asymp_pinned: quality = 'asymp_pinned'
-    elif residual_std > 0.01: quality = 'high_residual'
-    elif n_total < 1000: quality = 'low_sample'
-
-    scatter = [
+    # Sigmoid scatter on the rate-adjusted-by-final-ramp data
+    sig_scatter = [
         {'bin_mid_bp': round(float(r['bin_mid_bp']), 1),
          'n': int(r['n']),
          'actual_smm': round(float(r['actual_smm']), 6),
-         'actual_cpr': round(float((1 - (1 - r['actual_smm'])**12) * 100), 3)}
-        for _, r in agg.iterrows()
+         'actual_cpr': round(float((1 - (1 - r['actual_smm']) ** 12) * 100), 3)}
+        for _, r in sig_agg.iterrows()
     ]
+
+    # Age-ramp scatter: bin loans by age and compute mean(actual_smm / sigmoid_pred)
+    sig_per_row = _sigmoid_func(net_bps, sig_params['floor'], sig_params['asymp'],
+                                  sig_params['mid'],  sig_params['slope'])
+    residual_ratio = actual_smm / np.maximum(sig_per_row, 1e-9)
+    n_age_bins = min(8, max(3, int(n_total / 1000)))
+    try:
+        a_bins = pd.qcut(ages, n_age_bins, labels=False, duplicates='drop')
+        a_agg = (pd.DataFrame({'age': ages, 'rr': residual_ratio,
+                                 'smm': actual_smm, 'bin': a_bins})
+                   .groupby('bin').agg(n=('age', 'size'),
+                                         bin_mid_age=('age', 'mean'),
+                                         ramp_y=('rr', 'mean'),
+                                         actual_smm=('smm', 'mean'))
+                   .reset_index().sort_values('bin_mid_age').reset_index(drop=True))
+        # Normalize the empirical ramp scatter to the anchor (age=96m) so it's
+        # directly comparable to the fitted age_knots_y
+        anchor_y = age_knots_y[c8.AGE_RAMP_ANCHOR_IDX]
+        a_agg['ramp_y_norm'] = a_agg['ramp_y'] / max(anchor_y, 1e-6) * \
+                                 (anchor_y if anchor_y > 1e-6 else 1.0)
+        age_scatter = [
+            {'bin_mid_age': round(float(r['bin_mid_age']), 1),
+             'n': int(r['n']),
+             'ramp_y': round(float(r['ramp_y']), 4),
+             'actual_smm': round(float(r['actual_smm']), 6),
+             'actual_cpr': round(float((1 - (1 - r['actual_smm']) ** 12) * 100), 3)}
+            for _, r in a_agg.iterrows()
+        ]
+    except (ValueError, IndexError):
+        age_scatter = []
+
+    # Pinning + quality
+    lo_b, hi_b = c8.SIGMOID_BOUNDS
+    asymp_pinned = (sig_params['asymp'] < lo_b[1] + 1e-4) \
+                    or (sig_params['asymp'] > hi_b[1] - 1e-4)
+    floor_pinned = (sig_params['floor'] < lo_b[0] + 1e-5) \
+                    or (sig_params['floor'] > hi_b[0] - 1e-5)
+    quality = 'good'
+    if asymp_pinned:                        quality = 'asymp_pinned'
+    elif sig_residual_std > 0.01:           quality = 'high_residual'
+    elif n_total < 1000:                    quality = 'low_sample'
+
     fit_summary = {
-        'fit_quality': quality, 'residual_std': round(residual_std, 6),
+        'fit_quality': quality, 'residual_std': round(sig_residual_std, 6),
         'n': int(n_total), 'n_events': int(actual_smm.sum()),
-        'n_bins': int(len(agg)),
-        'asymp_pinned': bool(asymp_pinned),
-        'floor_pinned': bool(floor_pinned),
+        'n_bins': int(len(sig_agg)), 'n_iters': int(n_iters),
+        'asymp_pinned': bool(asymp_pinned), 'floor_pinned': bool(floor_pinned),
     }
-    return params, scatter, fit_summary
+    return params, sig_scatter, age_scatter, fit_summary
 
 
 def fit_all_cohorts(df_train: pd.DataFrame, min_events: int = MIN_EVENTS_PER_COHORT
                      ) -> tuple[dict, dict, dict]:
-    """Walk every primary cohort + each fallback level. Fit a sigmoid wherever
-    we have ≥ min_events prepay events. The fallback hierarchy ensures every
-    loan-month maps to *some* fitted cohort.
-
-    Returns:
-        cohort_table     : {cohort_id_or_fallback: {floor, asymp, mid, slope}}
-        cohort_diag      : {cohort_id: {scatter, fit_summary, axes, sancap_ref?}}
-        global_fit_summary
+    """Walk every primary cohort + each fallback level. Each cohort gets a
+    joint sigmoid + age_ramp fit via iterative refinement. Fallback hierarchy
+    is now 5-level (drop size → drop purpose → drop age → drop program → GLOBAL).
     """
     feats = features_dict(df_train)
     cohorts = c8.assign_cohort(feats)
     df_train = df_train.assign(_cohort=cohorts)
     smm_actual = df_train['prepaid_voluntary'].astype(float).values
+    age_arr = df_train['loan_age_months'].values
 
-    cohort_table = {}     # populated below
-    cohort_diag  = {}     # cohort_id → {scatter, fit_summary, axes}
+    cohort_table = {}
+    cohort_diag  = {}
     seen_keys = set()
 
     print(f"\nCohort fitting (min_events = {min_events}):")
-    print(f"  {'cohort':<28}  {'level':<5}  {'n':>9}  {'events':>7}  {'fit_quality':<14}")
+    print(f"  {'cohort':<35}  {'level':<5}  {'n':>9}  {'events':>7}  {'fit_quality':<14}")
 
-    # Build a canonical list of fallback keys, most-specific first
     primary_cohorts = sorted(set(cohorts))
-    levels_for = {0: primary_cohorts,
-                  1: sorted({c8.fallback_id(c, 1) for c in primary_cohorts}),
-                  2: sorted({c8.fallback_id(c, 2) for c in primary_cohorts}),
-                  3: ['GLOBAL']}
+    levels_for = {
+        0: primary_cohorts,
+        1: sorted({c8.fallback_id(c, 1) for c in primary_cohorts}),
+        2: sorted({c8.fallback_id(c, 2) for c in primary_cohorts}),
+        3: sorted({c8.fallback_id(c, 3) for c in primary_cohorts}),
+        4: ['GLOBAL'],
+    }
 
-    # FIT each cohort that has enough events. We fit at every level so the
-    # fallback chain has somewhere to land for sparse cells.
-    for level in [0, 1, 2, 3]:
+    for level in [0, 1, 2, 3, 4]:
         for fb_key in levels_for[level]:
             if fb_key in cohort_table or fb_key in seen_keys:
                 continue
             seen_keys.add(fb_key)
-            # Members of this cohort = primary cohorts whose fallback at `level` matches
-            if level == 3:
+            if level == 4:
                 mask = np.ones(len(df_train), dtype=bool)
             else:
                 primary_match = [c for c in primary_cohorts
                                   if c8.fallback_id(c, level) == fb_key]
                 mask = df_train['_cohort'].isin(primary_match).values
+            sub_age = age_arr[mask]
             sub_net = df_train.loc[mask, 'net_refi_incentive_bps'].values
             sub_smm = smm_actual[mask]
-            if sub_smm.sum() < min_events:
-                if level < 3: continue
-            params, scatter, summary = _fit_one_cohort(sub_net, sub_smm)
+            if sub_smm.sum() < min_events and level < 4:
+                continue
+            params, sig_scatter, age_scatter, summary = _fit_one_cohort(
+                sub_age, sub_net, sub_smm)
             if params is None:
                 continue
             cohort_table[fb_key] = params
-            # Only record full diagnostics for primary cohorts (level 0)
             if level == 0:
+                axes = dict(zip(['program', 'purpose', 'size', 'age_bucket'],
+                                  c8.cohort_axes(fb_key)))
                 cohort_diag[fb_key] = {
                     'cohort_id':    fb_key,
                     'level':        0,
-                    'axes':         dict(zip(['program', 'purpose', 'size'],
-                                              c8.cohort_axes(fb_key))),
+                    'axes':         axes,
                     'params':       params,
-                    'scatter':      scatter,
+                    'scatter':      sig_scatter,
+                    'age_scatter':  age_scatter,
                     **summary,
                 }
-            print(f"  {fb_key:<28}  {level:<5}  {summary['n']:>9,}  "
+            print(f"  {fb_key:<35}  {level:<5}  {summary['n']:>9,}  "
                   f"{summary['n_events']:>7,}  {summary['fit_quality']:<14}")
 
-    # Ensure GLOBAL fallback exists no matter what
     if 'GLOBAL' not in cohort_table:
-        print("  WARNING: GLOBAL fallback fit failed; using initial seed sigmoid")
-        cohort_table['GLOBAL'] = dict(c8.INITIAL_SIGMOID_SEED)
+        print("  WARNING: GLOBAL fallback fit failed; using initial seeds")
+        cohort_table['GLOBAL'] = {**c8.INITIAL_SIGMOID_SEED,
+                                   'age_knots_y': c8.AGE_RAMP_INITIAL_Y.tolist()}
 
-    print(f"\nFitted {len(cohort_table)} cohort/fallback sigmoids "
+    print(f"\nFitted {len(cohort_table)} cohort/fallback fits "
           f"({sum(1 for k in cohort_table if k in cohort_diag)} primary)")
     return cohort_table, cohort_diag, {}
 
 
 def build_curve_grids(cohort_table: dict, n_points: int = N_CURVE_GRID_POINTS,
                        net_bp_range: tuple = (-500, 500)) -> dict:
-    """For each fitted cohort, evaluate the sigmoid on a smooth grid for the
-    dashboard's fitted-curve overlay.
+    """For each cohort: smooth sigmoid grid (at age=anchor 96m) for the dashboard.
+    The age_ramp at anchor = 1.0 by construction, so this is the "rate-only" curve.
     """
     grids = {}
     xs = np.linspace(net_bp_range[0], net_bp_range[1], n_points)
@@ -334,6 +411,22 @@ def build_curve_grids(cohort_table: dict, n_points: int = N_CURVE_GRID_POINTS,
              'pred_smm': round(float(s), 6),
              'pred_cpr': round(float(c), 3)}
             for x, s, c in zip(xs, ys_smm, ys_cpr)
+        ]
+    return grids
+
+
+def build_age_ramp_grids(cohort_table: dict, n_points: int = 60,
+                          age_range: tuple = (0, 360)) -> dict:
+    """For each cohort: smooth age_ramp grid for the dashboard's Age Ramps tab."""
+    grids = {}
+    xs = np.linspace(age_range[0], age_range[1], n_points)
+    for cohort_id, p in cohort_table.items():
+        knots_y = p.get('age_knots_y', [1.0, 1.0, 1.0, 1.0])
+        ys = np.interp(xs, c8.AGE_RAMP_KNOTS_X, knots_y,
+                        left=knots_y[0], right=knots_y[-1])
+        grids[cohort_id] = [
+            {'age': round(float(a), 1), 'ramp_y': round(float(y), 4)}
+            for a, y in zip(xs, ys)
         ]
     return grids
 
@@ -494,46 +587,44 @@ def build_sample_loans_table_v8(df_test: pd.DataFrame, cohort_table: dict,
     smm = _predict_for_diag(sample, cohort_table, v7_params, flavor)
     cpr = (1 - (1 - smm) ** 12) * 100
 
-    # Per-row decomposition: cohort_sigmoid (the "rate" component) +
-    # M_age, M_maturity, M_lockout, M_burnout (V8b only)
+    # Per-row decomposition: cohort_sigmoid (rate component, at anchor age) +
+    # cohort_age_ramp (V8.1 native age component) + structural mults (V8b)
     cohorts_assigned = c8.assign_cohort(feats)
-    p_per_row = c8._lookup_sigmoid_params(cohorts_assigned, cohort_table)
-    cohort_smm = c8.cohort_sigmoid(feats['net_refi_incentive_bps'], p_per_row)
+    sig_per_row, age_knots_per_row = c8._lookup_cohort_params(cohorts_assigned, cohort_table)
+    cohort_sig_smm = c8.cohort_sigmoid(feats['net_refi_incentive_bps'], sig_per_row)
+    age_ramp_per_row = c8._vectorized_age_ramp(feats['loan_age_months'], age_knots_per_row)
+    cohort_smm = cohort_sig_smm * age_ramp_per_row     # full cohort prediction (sigmoid × ramp)
     if flavor == 'v8b':
-        m_age = v7m.m_age(feats['loan_age_months'], v7_params['M_age'])
         m_mat = v7m.m_maturity(feats['months_to_maturity'], v7_params['M_maturity'])
         m_lck = v7m.m_lockout(feats['months_since_lockout_end'], v7_params['M_lockout'])
         m_brn = v7m.m_burnout(feats['burn_ratio'], v7_params['M_burnout'])
     else:
-        m_age = m_mat = m_lck = m_brn = np.ones_like(cohort_smm)
+        m_mat = m_lck = m_brn = np.ones_like(cohort_smm)
 
-    # Use a simple log-attribution decomposition for the dashboard's color cells
     out = []
     for i in range(len(sample)):
         row = sample.iloc[i]
         cohort_cpr = float((1 - (1 - cohort_smm[i]) ** 12) * 100)
+        log_age_ramp = math.log(max(float(age_ramp_per_row[i]), 1e-9))
         log_components = {
-            'cohort_sigmoid': math.log(max(float(cohort_smm[i]) /
-                                            max(float(cohort_smm[i]) /
-                                                max(float(cohort_smm[i]), 1e-12), 1.0), 1e-12)),
-            'M_age':      math.log(max(float(m_age[i]), 1e-9)),
-            'M_maturity': math.log(max(float(m_mat[i]), 1e-9)),
-            'M_lockout':  math.log(max(float(m_lck[i]), 1e-9)),
-            'M_burnout':  math.log(max(float(m_brn[i]), 1e-9)),
+            'M_age_cohort': log_age_ramp,
+            'M_maturity':   math.log(max(float(m_mat[i]), 1e-9)),
+            'M_lockout':    math.log(max(float(m_lck[i]), 1e-9)),
+            'M_burnout':    math.log(max(float(m_brn[i]), 1e-9)),
         }
-        # Attribution: cohort_sigmoid takes the (cohort_cpr - global_baseline)
-        # component, and each multiplier takes its log share of (pred - cohort).
-        global_cpr = (1 - (1 - 0.0078) ** 12) * 100   # ≈ panel mean
-        cohort_attr = cohort_cpr - global_cpr
+        # Attribution split: rate-component CPR via cohort sigmoid at anchor age,
+        # then age_ramp's contribution within the cohort, then structural mults.
         post_cohort_gap = float(cpr[i]) - cohort_cpr
-        sum_log_mults = (log_components['M_age'] + log_components['M_maturity']
-                          + log_components['M_lockout'] + log_components['M_burnout'])
-        mult_attr = {}
+        sum_log_mults = (log_components['M_maturity'] + log_components['M_lockout']
+                          + log_components['M_burnout'])
+        mult_attr = {'M_age_cohort': round(
+            float((1 - (1 - cohort_smm[i]) ** 12) * 100
+                  - (1 - (1 - cohort_sig_smm[i]) ** 12) * 100), 4)}
         if abs(sum_log_mults) > 1e-9:
-            for k in ['M_age', 'M_maturity', 'M_lockout', 'M_burnout']:
+            for k in ['M_maturity', 'M_lockout', 'M_burnout']:
                 mult_attr[k] = round(log_components[k] / sum_log_mults * post_cohort_gap, 4)
         else:
-            for k in ['M_age', 'M_maturity', 'M_lockout', 'M_burnout']:
+            for k in ['M_maturity', 'M_lockout', 'M_burnout']:
                 mult_attr[k] = 0.0
 
         def yyyymm(v):
@@ -588,10 +679,10 @@ def build_sample_loans_table_v8(df_test: pd.DataFrame, cohort_table: dict,
             'pred_cpr':      round(float(cpr[i]), 2),
             'actual_prepay': int(row['prepaid_voluntary']),
             'multipliers':   {
-                'M_age':      round(float(m_age[i]), 4),
-                'M_maturity': round(float(m_mat[i]), 4),
-                'M_lockout':  round(float(m_lck[i]), 4),
-                'M_burnout':  round(float(m_brn[i]), 4),
+                'M_age_cohort': round(float(age_ramp_per_row[i]), 4),
+                'M_maturity':   round(float(m_mat[i]), 4),
+                'M_lockout':    round(float(m_lck[i]), 4),
+                'M_burnout':    round(float(m_brn[i]), 4),
             },
             'attribution':   mult_attr,
         })
@@ -706,6 +797,7 @@ def main():
     # Fit per-cohort sigmoids
     cohort_table, cohort_diag, _ = fit_all_cohorts(df_train, MIN_EVENTS_PER_COHORT)
     cohort_curve_grids = build_curve_grids(cohort_table)
+    cohort_age_ramp_grids = build_age_ramp_grids(cohort_table)
 
     # Pull V7's structural multipliers (for V8b)
     v7_md = json.load(open(V7_JSON)) if V7_JSON.exists() else None
@@ -786,7 +878,13 @@ def main():
         'cohort_table':         cohort_table,
         'cohort_definitions':   list(cohort_diag.values()),
         'cohort_curve_grids':   cohort_curve_grids,
-        'v7_structural_params': {k: v7_params[k] for k in ['M_age', 'M_maturity', 'M_lockout', 'M_burnout']
+        'cohort_age_ramp_grids':cohort_age_ramp_grids,
+        'age_ramp_knots_x':     c8.AGE_RAMP_KNOTS_X.tolist(),
+        'age_bucket_breaks':    c8.AGE_BUCKET_BREAKS,
+        'age_bucket_keys':      c8.AGE_BUCKET_KEYS,
+        # V8.1: M_age is NO LONGER in v7_structural_params — it's replaced by
+        # the per-cohort age_ramp inside cohort_table.
+        'v7_structural_params': {k: v7_params[k] for k in ['M_maturity', 'M_lockout', 'M_burnout']
                                   if k in v7_params},
         'monthly': monthly, 'yearly': yearly, 'scurve': scurve,
         'calibration': cal,
