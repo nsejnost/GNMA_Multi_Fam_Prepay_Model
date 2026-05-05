@@ -166,7 +166,7 @@ function TabCohortSCurves({ md }) {
                                                        `actual (n=${p.payload.n})`]
                                  : [v, n]} />
                     <ReferenceLine x={0} stroke={T.textDim} strokeDasharray="2 2" />
-                    <Scatter name="actual" data={scatter} fill={color}
+                    <Scatter name="actual" dataKey="y" data={scatter} fill={color}
                              shape="circle" />
                     <Line name="fitted" type="monotone" dataKey="y" data={gridLine}
                           stroke={color} strokeWidth={2} dot={false} />
@@ -295,7 +295,7 @@ function TabCohortBrowser({ md }) {
                           fill: T.textDim, fontSize: 11 }} />
           <Tooltip {...tooltipStyle} />
           <ReferenceLine x={0} stroke={T.textDim} strokeDasharray="2 2" />
-          <Scatter name="actual_cpr (per bin)"
+          <Scatter name="actual_cpr (per bin)" dataKey="y"
                    data={merged.map(m => ({ x: m.bin_mid, y: m.actual_cpr, n: m.n }))}
                    fill={T.accent} />
           <Line name="fitted_cpr" type="monotone" dataKey="y"
